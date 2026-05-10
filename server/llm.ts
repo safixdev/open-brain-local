@@ -1,9 +1,6 @@
 // server/llm.ts
 // Local-deploy seam: all LLM provider calls flow through this file.
-// At commit 1 this is upstream-equivalent; later commits parameterize it.
-
-const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
-const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+// Provider is selected via env vars; defaults target local Ollama on the host.
 
 export const UPSTREAM_SYSTEM_PROMPT = `Extract metadata from the user's captured thought. Return JSON with:
 - "people": array of people mentioned (empty if none)
@@ -14,34 +11,39 @@ export const UPSTREAM_SYSTEM_PROMPT = `Extract metadata from the user's captured
 Only extract what's explicitly there.`;
 
 export async function getEmbedding(text: string): Promise<number[]> {
-  const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+  const base = Deno.env.get("LLM_BASE") ?? "http://host.docker.internal:11434/v1";
+  const key = Deno.env.get("LLM_API_KEY") ?? "ollama";
+  const model = Deno.env.get("EMBED_MODEL") ?? "mxbai-embed-large";
+
+  const r = await fetch(`${base}/embeddings`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
-      input: text,
-    }),
+    body: JSON.stringify({ model, input: text }),
   });
   if (!r.ok) {
     const msg = await r.text().catch(() => "");
-    throw new Error(`OpenRouter embeddings failed: ${r.status} ${msg}`);
+    throw new Error(`Embedding failed: ${r.status} ${msg}`);
   }
   const d = await r.json();
   return d.data[0].embedding;
 }
 
 export async function extractMetadata(text: string): Promise<Record<string, unknown>> {
-  const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+  const base = Deno.env.get("LLM_BASE") ?? "http://host.docker.internal:11434/v1";
+  const key = Deno.env.get("LLM_API_KEY") ?? "ollama";
+  const model = Deno.env.get("CHAT_MODEL") ?? "gemma3:4b";
+
+  const r = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: UPSTREAM_SYSTEM_PROMPT },

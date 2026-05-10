@@ -22,3 +22,39 @@ Deno.test("llm.ts exports UPSTREAM_SYSTEM_PROMPT as a non-empty string", () => {
   assertEquals(typeof UPSTREAM_SYSTEM_PROMPT, "string");
   assertEquals(UPSTREAM_SYSTEM_PROMPT.length > 0, true);
 });
+
+// Integration test: getEmbedding actually hits Ollama and returns a vector.
+// Requires Ollama running on localhost:11434 with mxbai-embed-large pulled.
+Deno.test({
+  name: "getEmbedding returns a 1024-dim vector from local Ollama",
+  async fn() {
+    Deno.env.set("LLM_BASE", "http://localhost:11434/v1");
+    Deno.env.set("LLM_API_KEY", "ollama");
+    Deno.env.set("EMBED_MODEL", "mxbai-embed-large");
+
+    const v = await getEmbedding("hello world");
+
+    assertEquals(Array.isArray(v), true);
+    assertEquals(v.length, 1024);
+    assertEquals(typeof v[0], "number");
+  },
+});
+
+// Integration test: extractMetadata returns a JSON object with the expected
+// keys, using the upstream prompt (Task 5 will change the prompt).
+Deno.test({
+  name: "extractMetadata returns the expected JSON shape from local Ollama",
+  async fn() {
+    Deno.env.set("LLM_BASE", "http://localhost:11434/v1");
+    Deno.env.set("LLM_API_KEY", "ollama");
+    Deno.env.set("CHAT_MODEL", "gemma3:4b");
+
+    const m = await extractMetadata("Coffee with Sarah about Q3 mobile launch.");
+
+    assertExists(m.topics);
+    assertEquals(Array.isArray(m.topics), true);
+    assertEquals((m.topics as string[]).length >= 1, true);
+    assertExists(m.type);
+    assertEquals(typeof m.type, "string");
+  },
+});
