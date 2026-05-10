@@ -58,3 +58,26 @@ Deno.test({
     assertEquals(typeof m.type, "string");
   },
 });
+
+// extractMetadata should resolve "December 15" with the current year.
+// (We only check the YEAR — day-of-week math can still be wrong;
+//  see spec risks section.)
+Deno.test({
+  name: "extractMetadata resolves dates to the current year",
+  async fn() {
+    Deno.env.set("LLM_BASE", "http://localhost:11434/v1");
+    Deno.env.set("LLM_API_KEY", "ollama");
+    Deno.env.set("CHAT_MODEL", "gemma3:4b");
+
+    const thisYear = new Date().getFullYear().toString();
+    const m = await extractMetadata("Mom's birthday is December 15. Need to book the restaurant.");
+
+    const dates = (m.dates_mentioned as string[] | undefined) ?? [];
+    assertEquals(dates.length >= 1, true, "Expected at least one date");
+    assertEquals(
+      dates.some((d) => d.startsWith(thisYear)),
+      true,
+      `Expected at least one date starting with ${thisYear}, got: ${JSON.stringify(dates)}`,
+    );
+  },
+});
