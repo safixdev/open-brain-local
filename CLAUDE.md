@@ -2,6 +2,8 @@
 
 This file helps AI coding tools (Claude Code, Codex, Cursor, etc.) work effectively in this repo.
 
+> **If you're on the `local-deploy` branch, also read [`LOCAL_DEPLOY.md`](./LOCAL_DEPLOY.md).** That branch is a personal fork variant that runs OB1 fully locally (Postgres + pgvector + bare-Deno function + Ollama, no cloud). Several rules below are intentionally relaxed there — most notably, the "MCP servers must be remote" guardrail does not apply, because the fork's whole point is running the same `server/index.ts` directly on the host with `deno run` instead of inside Supabase's edge-runtime container. `LOCAL_DEPLOY.md` describes the five commits, what they change, and how to deploy. Upstream `main` is unaffected; the rules below remain authoritative for upstream contributions.
+
 ## What This Repo Is
 
 Open Brain is a persistent AI memory system — one database (Supabase + pgvector), one MCP protocol, any AI client. This repo contains the extensions, recipes, schemas, dashboards, integrations, and skills that the community builds on top of the core Open Brain setup.
