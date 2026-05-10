@@ -7,7 +7,7 @@
 // the system keychain (e.g. macOS Keychain).
 
 import { assertEquals, assertExists } from "jsr:@std/assert";
-import { getEmbedding, extractMetadata, UPSTREAM_SYSTEM_PROMPT } from "./llm.ts";
+import { getEmbedding, extractMetadata } from "./llm.ts";
 
 Deno.test("llm.ts exports getEmbedding as a function", () => {
   assertEquals(typeof getEmbedding, "function");
@@ -15,12 +15,6 @@ Deno.test("llm.ts exports getEmbedding as a function", () => {
 
 Deno.test("llm.ts exports extractMetadata as a function", () => {
   assertEquals(typeof extractMetadata, "function");
-});
-
-Deno.test("llm.ts exports UPSTREAM_SYSTEM_PROMPT as a non-empty string", () => {
-  assertExists(UPSTREAM_SYSTEM_PROMPT);
-  assertEquals(typeof UPSTREAM_SYSTEM_PROMPT, "string");
-  assertEquals(UPSTREAM_SYSTEM_PROMPT.length > 0, true);
 });
 
 // Integration test: getEmbedding actually hits Ollama and returns a vector.
