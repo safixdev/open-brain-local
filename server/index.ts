@@ -466,12 +466,6 @@ app.options("*", (c) => {
 });
 
 app.all("*", async (c) => {
-  // Accept access key via header OR URL query parameter
-  const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
-    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
-  }
-
   // Fix: Claude Desktop connectors don't send the Accept header that
   // StreamableHTTPTransport requires. Build a patched request if missing.
   // See: https://github.com/NateBJones-Projects/OB1/issues/33
