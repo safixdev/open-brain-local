@@ -1,0 +1,90 @@
+# docker/docker-compose.yml
+# Open Brain — docker-compose stack (no Supabase, Ollama-only)
+#
+# Prerequisites:
+#   cp .env.example .env
+#   cp .env.secrets.example .env.secrets
+#   # Edit .env.secrets: set MCP_ACCESS_KEY and POSTGRES_PASSWORD
+#
+# Start:
+#   docker compose up -d
+#
+# First run pulls ~4 GB of Ollama models; the server waits until the pull completes.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    env_file:
+      - .env
+      - .env.secrets
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: "${POSTGRES_DB:-openbrain}"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./init/01-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  ollama-pull:
+    image: ollama/ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+      EMBED_MODEL: "${EMBED_MODEL:-mxbai-embed-large}"
+      CHAT_MODEL: "${CHAT_MODEL:-gemma3:4b}"
+    entrypoint:
+      - sh
+      - -c
+      - "ollama pull $${EMBED_MODEL} && ollama pull $${CHAT_MODEL}"
+    volumes:
+      - ollama:/root/.ollama
+    restart: "no"
+
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      secrets:
+        - ca
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+      - .env.secrets
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  ollama:
+
+# Build-time CA for the server image. Behind a corporate TLS proxy, set
+# CA_CERT_FILE to your CA path before building:
+#   CA_CERT_FILE=./corp-ca.pem docker compose up -d --build
+# Defaults to /dev/null (empty) → the build secret is a no-op on clean networks.
+secrets:
+  ca:
+    file: ${CA_CERT_FILE:-/dev/null}

@@ -16,6 +16,9 @@ __pycache__/
 .env
 .env.local
 .env.*.local
+docker/.env
+docker/.env.secrets
+docker/*.pem
 credentials.json
 token.json
 gmail-sync-log.json
