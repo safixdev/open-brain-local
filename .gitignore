@@ -19,6 +19,8 @@ __pycache__/
 docker/.env
 docker/.env.secrets
 docker/*.pem
+docker/openbrain-data/data/
+docker/openbrain-data/ollama/
 credentials.json
 token.json
 gmail-sync-log.json
