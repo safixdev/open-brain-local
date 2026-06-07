@@ -4,30 +4,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
-import { createClient } from "@supabase/supabase-js";
 import { getEmbedding, extractMetadata } from "./llm.ts";
+import { db } from "./db.ts";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-type ThoughtMatch = {
-  id: string;
-  content: string;
-  metadata: Record<string, unknown>;
-  similarity: number;
-  created_at: string;
-};
-
-type ThoughtRecord = {
-  id: string;
-  content: string;
-  metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at?: string | null;
-};
 
 const CITATION_BASE_URL =
   Deno.env.get("OPEN_BRAIN_CITATION_BASE_URL") || "https://openbrain.local/thoughts";
@@ -67,12 +47,7 @@ server.registerTool(
   async ({ query }) => {
     try {
       const qEmb = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_thoughts", {
-        query_embedding: qEmb,
-        match_threshold: 0.5,
-        match_count: 10,
-        filter: {},
-      });
+      const { data, error } = await db.matchThoughts(qEmb, 0.5, 10, {});
 
       if (error) {
         return {
@@ -81,11 +56,13 @@ server.registerTool(
         };
       }
 
-      const results = ((data || []) as ThoughtMatch[]).map((t) => ({
-        id: t.id,
-        title: thoughtTitle(t.content, t.created_at),
-        url: thoughtUrl(t.id),
-      }));
+      const results = ((data || []) as { id: string; content: string; created_at: string }[]).map(
+        (t) => ({
+          id: t.id,
+          title: thoughtTitle(t.content, t.created_at),
+          url: thoughtUrl(t.id),
+        })
+      );
 
       return {
         content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
@@ -114,11 +91,7 @@ server.registerTool(
   },
   async ({ id }) => {
     try {
-      const { data, error } = await supabase
-        .from("thoughts")
-        .select("id, content, metadata, created_at, updated_at")
-        .eq("id", id)
-        .single();
+      const { data, error } = await db.getThoughtById(id);
 
       if (error) {
         return {
@@ -127,7 +100,7 @@ server.registerTool(
         };
       }
 
-      const thought = data as ThoughtRecord;
+      const thought = data!;
       const document = {
         id: thought.id,
         title: thoughtTitle(thought.content, thought.created_at),
@@ -171,12 +144,7 @@ server.registerTool(
   async ({ query, limit, threshold }) => {
     try {
       const qEmb = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_thoughts", {
-        query_embedding: qEmb,
-        match_threshold: threshold,
-        match_count: limit,
-        filter: {},
-      });
+      const { data, error } = await db.matchThoughts(qEmb, threshold, limit, {});
 
       if (error) {
         return {
@@ -193,7 +161,7 @@ server.registerTool(
 
       const results = data.map(
         (
-          t: ThoughtMatch,
+          t: { id: string; content: string; metadata: Record<string, unknown>; similarity: number; created_at: string },
           i: number
         ) => {
           const m = t.metadata || {};
@@ -250,22 +218,7 @@ server.registerTool(
   },
   async ({ limit, type, topic, person, days }) => {
     try {
-      let q = supabase
-        .from("thoughts")
-        .select("content, metadata, created_at")
-        .order("created_at", { ascending: false })
-        .limit(limit);
-
-      if (type) q = q.contains("metadata", { type });
-      if (topic) q = q.contains("metadata", { topics: [topic] });
-      if (person) q = q.contains("metadata", { people: [person] });
-      if (days) {
-        const since = new Date();
-        since.setDate(since.getDate() - days);
-        q = q.gte("created_at", since.toISOString());
-      }
-
-      const { data, error } = await q;
+      const { data, error } = await db.listThoughts({ limit, type, topic, person, days });
 
       if (error) {
         return {
@@ -280,12 +233,12 @@ server.registerTool(
 
       const results = data.map(
         (
-          t: { content: string; metadata: Record<string, unknown>; created_at: string },
+          t: { content?: string; metadata: Record<string, unknown>; created_at: string },
           i: number
         ) => {
           const m = t.metadata || {};
           const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${(t as { content?: string }).content ?? ""}`;
         }
       );
 
@@ -319,14 +272,8 @@ server.registerTool(
   },
   async () => {
     try {
-      const { count } = await supabase
-        .from("thoughts")
-        .select("*", { count: "exact", head: true });
-
-      const { data } = await supabase
-        .from("thoughts")
-        .select("metadata, created_at")
-        .order("created_at", { ascending: false });
+      const { data: count } = await db.countThoughts();
+      const { data } = await db.allThoughtsMeta();
 
       const types: Record<string, number> = {};
       const topics: Record<string, number> = {};
@@ -404,9 +351,8 @@ server.registerTool(
         extractMetadata(content),
       ]);
 
-      const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
-        p_content: content,
-        p_payload: { metadata: { ...metadata, source: "mcp" } },
+      const { data: upsertResult, error: upsertError } = await db.upsertThought(content, {
+        metadata: { ...metadata, source: "mcp" },
       });
 
       if (upsertError) {
@@ -417,10 +363,7 @@ server.registerTool(
       }
 
       const thoughtId = upsertResult?.id;
-      const { error: embError } = await supabase
-        .from("thoughts")
-        .update({ embedding })
-        .eq("id", thoughtId);
+      const { error: embError } = await db.updateEmbedding(thoughtId!, embedding);
 
       if (embError) {
         return {
