@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { getEmbedding, extractMetadata } from "./llm.ts";
 import { db } from "./db.ts";
+import { diffSince, fetchArtifact } from "./artifactory.ts";
 
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
@@ -429,5 +430,71 @@ app.all("*", async (c) => {
   await server.connect(transport);
   return transport.handleRequest(c);
 });
+
+// --- Autosync: Artifactory → Postgres every 5 minutes ---
+// In-memory cursor: advances after each successful run so only genuinely new
+// Artifactory artifacts are fetched. Resets to epoch on server restart (safe —
+// upsert_thought is idempotent; hasEmbedding skips re-embedding).
+
+const AUTOSYNC_INTERVAL_MS = parseInt(
+  Deno.env.get("AUTOSYNC_INTERVAL_MS") ?? String(5 * 60 * 1000),
+);
+let _syncCursor = "1970-01-01T00:00:00.000Z";
+
+async function runAutoSync(): Promise<void> {
+  const newArtifacts = await diffSince(_syncCursor);
+
+  if (!newArtifacts.length) {
+    console.log(`[autosync] up to date (cursor: ${_syncCursor.slice(0, 19)})`);
+    return;
+  }
+
+  console.log(`[autosync] ${newArtifacts.length} new artifact(s) since ${_syncCursor.slice(0, 19)}`);
+
+  for (const { path } of newArtifacts) {
+    try {
+      const artifact = await fetchArtifact(path);
+
+      const { data: upsertData, error: upsertErr } = await db.upsertThought(
+        artifact.content,
+        { metadata: { ...artifact.metadata, artifact_path: path } },
+      );
+
+      if (upsertErr || !upsertData) {
+        console.error(`[autosync] upsert failed for ${path}:`, upsertErr?.message);
+        continue;
+      }
+
+      const { data: alreadyEmbedded } = await db.hasEmbedding(upsertData.id);
+      if (alreadyEmbedded) {
+        console.log(`[autosync] skip embed (already present): ${artifact.content.slice(0, 60)}`);
+        continue;
+      }
+
+      const embedding = await getEmbedding(artifact.content);
+      await db.updateEmbedding(upsertData.id, embedding);
+      console.log(`[autosync] embedded: ${artifact.content.slice(0, 60)}`);
+    } catch (err) {
+      console.error(`[autosync] error on ${path}:`, (err as Error).message);
+    }
+  }
+
+  // Advance cursor to now — next run fetches only artifacts created after this point.
+  _syncCursor = new Date().toISOString();
+  console.log(`[autosync] cursor → ${_syncCursor.slice(0, 19)}`);
+}
+
+// Fire immediately on startup, then on the configured interval.
+runAutoSync().catch((e) =>
+  console.error("[autosync] startup sync failed:", (e as Error).message)
+);
+setInterval(
+  () =>
+    runAutoSync().catch((e) =>
+      console.error("[autosync] interval sync failed:", (e as Error).message)
+    ),
+  AUTOSYNC_INTERVAL_MS,
+);
+console.log(`[autosync] started — interval ${AUTOSYNC_INTERVAL_MS / 1000}s`);
 
 Deno.serve(app.fetch);

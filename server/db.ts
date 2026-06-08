@@ -64,6 +64,8 @@ export interface Db {
   ): Promise<DbResult<{ id: string }>>;
 
   updateEmbedding(id: string, embedding: number[]): Promise<DbResult<null>>;
+
+  hasEmbedding(id: string): Promise<DbResult<boolean>>;
 }
 
 // ── Supabase driver ──────────────────────────────────────────────────────────
@@ -150,6 +152,15 @@ function makeSupabaseDb(): Db {
         .update({ embedding })
         .eq("id", id);
       return { data: null, error };
+    },
+
+    async hasEmbedding(id) {
+      const { data, error } = await sb()
+        .from("thoughts")
+        .select("embedding")
+        .eq("id", id)
+        .single();
+      return { data: data ? data.embedding !== null : false, error };
     },
   };
 }
@@ -301,6 +312,21 @@ function makePostgresDb(): Db {
           [embStr(embedding), id],
         );
         return { data: null, error: null };
+      } catch (e) {
+        return { data: null, error: { message: (e as Error).message } };
+      } finally {
+        client.release();
+      }
+    },
+
+    async hasEmbedding(id) {
+      const client = await pool.connect();
+      try {
+        const result = await client.queryObject<{ has_embedding: boolean }>(
+          `SELECT (embedding IS NOT NULL) AS has_embedding FROM thoughts WHERE id = $1`,
+          [id],
+        );
+        return { data: result.rows[0]?.has_embedding ?? false, error: null };
       } catch (e) {
         return { data: null, error: { message: (e as Error).message } };
       } finally {
