@@ -6,7 +6,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { getEmbedding, extractMetadata } from "./llm.ts";
 import { db } from "./db.ts";
-import { diffSince, fetchArtifact } from "./artifactory.ts";
+import { diffSince, fetchArtifact, probeRtRoot, pushArtifact } from "./artifactory.ts";
 
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
@@ -347,31 +347,26 @@ server.registerTool(
   },
   async ({ content }) => {
     try {
-      const [embedding, metadata] = await Promise.all([
-        getEmbedding(content),
+      const [, metadata] = await Promise.all([
+        Promise.resolve(null),
         extractMetadata(content),
       ]);
 
-      const { data: upsertResult, error: upsertError } = await db.upsertThought(content, {
-        metadata: { ...metadata, source: "mcp" },
+      // Push to Artifactory (SOT). pgvector is populated exclusively via sync.
+      const rtMeta = metadata as Record<string, unknown>;
+      const artifactId = await (async () => {
+        const buf = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
+        return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+      })();
+      await pushArtifact({
+        id: artifactId,
+        content,
+        metadata: { ...rtMeta, source: "mcp" },
+        created_at: new Date().toISOString(),
       });
 
-      if (upsertError) {
-        return {
-          content: [{ type: "text" as const, text: `Failed to capture: ${upsertError.message}` }],
-          isError: true,
-        };
-      }
-
-      const thoughtId = upsertResult?.id;
-      const { error: embError } = await db.updateEmbedding(thoughtId!, embedding);
-
-      if (embError) {
-        return {
-          content: [{ type: "text" as const, text: `Failed to save embedding: ${embError.message}` }],
-          isError: true,
-        };
-      }
+      // Sync immediately so the new artifact lands in pgvector before we return.
+      await runAutoSync();
 
       const meta = metadata as Record<string, unknown>;
       let confirmation = `Captured as ${meta.type || "thought"}`;
@@ -388,6 +383,58 @@ server.registerTool(
     } catch (err: unknown) {
       return {
         content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 5: Trigger Sync
+server.registerTool(
+  "trigger_sync",
+  {
+    title: "Trigger Artifactory Sync",
+    description:
+      "Manually trigger a sync from Artifactory into Open Brain. Fetches all artifacts created since the last sync cursor and embeds any new ones. Use when you want to pull in new artifacts immediately rather than waiting for the next scheduled sync.",
+    annotations: {
+      readOnlyHint: false,
+      openWorldHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+    inputSchema: {
+      reset_cursor: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, reset the sync cursor to epoch and re-sync all artifacts from the beginning"),
+    },
+  },
+  async ({ reset_cursor }) => {
+    try {
+      if (reset_cursor) {
+        _syncCursor = "1970-01-01T00:00:00.000Z";
+        console.log("[trigger_sync] cursor reset to epoch");
+      }
+
+      const cursorBefore = _syncCursor;
+      await runAutoSync();
+      const cursorAfter = _syncCursor;
+
+      const advanced = cursorAfter !== cursorBefore;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: advanced
+              ? `Sync complete. Cursor advanced from ${cursorBefore.slice(0, 19)} → ${cursorAfter.slice(0, 19)}.`
+              : `Sync complete. Already up to date (cursor: ${cursorBefore.slice(0, 19)}).`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Sync error: ${(err as Error).message}` }],
         isError: true,
       };
     }
@@ -496,5 +543,8 @@ setInterval(
   AUTOSYNC_INTERVAL_MS,
 );
 console.log(`[autosync] started — interval ${AUTOSYNC_INTERVAL_MS / 1000}s`);
+probeRtRoot().catch((e) =>
+  console.error("[artifactory] probe failed:", (e as Error).message)
+);
 
 Deno.serve(app.fetch);

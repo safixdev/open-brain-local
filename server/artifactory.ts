@@ -32,11 +32,30 @@ type JfSearchItem = {
   repo: string;
 };
 
+// Deno.Command does not inherit the shell PATH, so jf at /opt/homebrew/bin
+// is invisible unless we pass it explicitly.
+// In Docker: jf is installed at /usr/local/bin/jf via Dockerfile.
+// On a dev host: override with JF_PATH env var (e.g. /opt/homebrew/bin/jf).
+const JF_PATH = Deno.env.get("JF_PATH") ?? "/usr/local/bin/jf";
+const ENRICHED_PATH = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  Deno.env.get("PATH") ?? "",
+].join(":");
+
 async function runJf(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const cmd = new Deno.Command("jf", {
+  const cmd = new Deno.Command(JF_PATH, {
     args: [...args, "--server-id", JF_SERVER_ID],
     stdout: "piped",
     stderr: "piped",
+    env: {
+      PATH: ENRICHED_PATH,
+      HOME: Deno.env.get("HOME") ?? "/home/deno",
+      USER: Deno.env.get("USER") ?? "deno",
+      TMPDIR: Deno.env.get("TMPDIR") ?? "/tmp",
+    },
   });
   const { code, stdout, stderr } = await cmd.output();
   return {
@@ -51,6 +70,30 @@ async function sha256Hex(text: string): Promise<string> {
   return Array.from(new Uint8Array(buf))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+// Print the resolved RT repo root to stdout so teammates can verify they share
+// the same path. Shells out to `jf config show` to surface the base URL.
+export async function probeRtRoot(): Promise<void> {
+  let baseUrl = "<unknown>";
+  try {
+    const cmd = new Deno.Command(JF_PATH, {
+      args: ["config", "show", "--server-id", JF_SERVER_ID],
+      stdout: "piped",
+      stderr: "piped",
+      env: { PATH: ENRICHED_PATH, HOME: Deno.env.get("HOME") ?? "" },
+    });
+    const { stdout } = await cmd.output();
+    const raw = new TextDecoder().decode(stdout).trim();
+    // `jf config show` emits JSON; extract url field
+    const match = raw.match(/"url"\s*:\s*"([^"]+)"/);
+    if (match) baseUrl = match[1].replace(/\/$/, "");
+  } catch {
+    // jf not installed or server not configured — still print what we know
+  }
+  console.log(`[artifactory] server-id : ${JF_SERVER_ID}`);
+  console.log(`[artifactory] base url  : ${baseUrl}`);
+  console.log(`[artifactory] repo root : ${baseUrl}/${RT_REPO}/thoughts/`);
 }
 
 // Push a thought artifact to Artifactory via `jf rt upload`.

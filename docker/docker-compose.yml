@@ -21,7 +21,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_DB: "${POSTGRES_DB:-openbrain}"
     volumes:
-      - ./openbrain-data/data:/var/lib/postgresql/data
+      - openbrain-pg-data:/var/lib/postgresql/data
       - ./init/01-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -33,7 +33,7 @@ services:
   ollama:
     image: ollama/ollama
     volumes:
-      - ./openbrain-data/ollama:/root/.ollama
+      - openbrain-ollama-data:/root/.ollama
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -56,7 +56,7 @@ services:
       - -c
       - "ollama pull $${EMBED_MODEL} && ollama pull $${CHAT_MODEL}"
     volumes:
-      - ./openbrain-data/ollama:/root/.ollama
+      - openbrain-ollama-data:/root/.ollama
     restart: "no"
 
   server:
@@ -75,12 +75,20 @@ services:
     env_file:
       - .env
       - .env.secrets
+    environment:
+      JF_PATH: /usr/local/bin/jf
+    volumes:
+      - ./jfrog-config:/home/deno/.jfrog:ro
     restart: unless-stopped
 
 # Build-time CA for the server image. Behind a corporate TLS proxy, set
 # CA_CERT_FILE to your CA path before building:
 #   CA_CERT_FILE=./corp-ca.pem docker compose up -d --build
 # Defaults to /dev/null (empty) → the build secret is a no-op on clean networks.
+volumes:
+  openbrain-pg-data:
+  openbrain-ollama-data:
+
 secrets:
   ca:
     file: ${CA_CERT_FILE:-/dev/null}
