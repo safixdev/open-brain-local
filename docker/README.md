@@ -1,6 +1,6 @@
 # Open Brain — Docker Compose Stack
 
-Run Open Brain fully in containers: Postgres + pgvector, Ollama (embeddings only), and the MCP server. Artifactory is the source of truth for memories; pgvector is a rebuildable search index synced from it.
+Run Open Brain fully in containers: Postgres + pgvector, HuggingFace TEI (embeddings), and the MCP server. Artifactory is the source of truth for memories; pgvector is a rebuildable search index synced from it.
 
 > Metadata (topics, type, people, …) is supplied by the **calling agent** via `capture_thought` — this stack runs **no chat model**. The only model is the embedding model.
 
@@ -11,8 +11,9 @@ Run Open Brain fully in containers: Postgres + pgvector, Ollama (embeddings only
 ## Prerequisites
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [Rancher Desktop](https://rancherdesktop.io/) (Compose v2 plugin required)
-- ~15 GB free disk (models: ~4 GB; images + DB: ~2 GB; headroom)
-- ~4.5 GB RAM available (peak during an active capture)
+- ~2 GB free disk: TEI image ~0.35 GB + embedding model ~0.67 GB + pgvector ~0.46 GB + server ~0.35 GB. Memories themselves are tiny (~10 MB per 1000).
+- ~2 GB RAM available (peak during an active capture)
+- Apple Silicon / arm64: set `TEI_IMAGE=ghcr.io/huggingface/text-embeddings-inference:cpu-arm64-latest` in `.env`
 
 ---
 
@@ -61,14 +62,28 @@ You must also provide Artifactory credentials for the `jf` CLI — see the
 
 ### 5. Start the stack
 
+Two distribution paths for the `server` image:
+
+**Option B — prebuilt image (recommended):** a maintainer pushes the image to
+your registry (see the `open-brain-up` skill *Publishing* section). Set
+`OPENBRAIN_IMAGE` in `.env` to the pushed ref, then:
+
 ```bash
+docker compose pull server
+docker compose up -d --no-build
+```
+
+**Option A — build from source:** leave `OPENBRAIN_IMAGE` unset.
+
+```bash
+docker compose build server   # add CA_CERT_FILE=./corp-ca.pem behind a TLS proxy
 docker compose up -d
 ```
 
-**First run downloads ~4 GB of Ollama models.** The `server` service waits until the `ollama-pull` one-shot completes, so it may take several minutes before the server is ready. Monitor progress:
+**On first run TEI loads the ~0.67 GB embedding model** (auto-downloaded from HuggingFace, or from a pre-fetched `tei-model/` mount on CDN-blocked networks — see the `open-brain-up` skill). The `server` waits until `tei` is healthy. Monitor progress:
 
 ```bash
-docker compose logs -f ollama-pull
+docker compose logs -f tei      # expect "Ready" + health → healthy
 docker compose logs -f server
 ```
 
@@ -113,7 +128,7 @@ jq '.mcpServers["open-brain"] = {
 }' ~/.claude.json > /tmp/.claude.json.new && mv /tmp/.claude.json.new ~/.claude.json
 ```
 
-Restart Claude Code, then run `/mcp` — `open-brain` should appear with all six tools.
+Restart Claude Code, then run `/mcp` — `open-brain` should appear with its four tools (`capture_thought`, `search_thoughts`, `list_thoughts`, `delete_thought`).
 
 ### Claude Desktop
 
@@ -138,11 +153,10 @@ Restart Claude Desktop.
 
 | State | RAM |
 |---|---|
-| Stack idle (db + ollama, no model loaded) | ~400 MB |
-| Active capture/search (embedding model loaded) | ~1.5 GB peak |
-| 5+ min idle (Ollama auto-unloads the model) | ~500 MB |
+| Stack idle (db + tei) | ~0.8 GB |
+| Active capture/search | ~1.5 GB peak |
 
-RAM drops automatically after 5 minutes of inactivity as Ollama unloads the model.
+TEI keeps the model resident (no load/unload churn), so latency is steady.
 
 ---
 
@@ -172,7 +186,8 @@ docker compose ps
 | Symptom | Fix |
 |---|---|
 | `server` exits immediately | Check `docker compose logs server` — likely missing env vars in `.env.secrets` |
-| Capture takes > 30 s on first run | Ollama is loading models into RAM — normal, subsequent calls are faster |
-| `expected 1024 dimensions` error | Wrong `EMBED_MODEL` — must match the DB schema dim (1024 for mxbai-embed-large) |
+| `tei` unhealthy with a CDN/`xethub` download error | Proxy blocks HF's CDN — pre-fetch the model and set `EMBED_MODEL=/model` (see `open-brain-up` skill) |
+| `tei` pull fails with `manifest unknown` | arm64 host — set `TEI_IMAGE=...:cpu-arm64-latest` |
+| `expected 1024 dimensions` error | Wrong `EMBED_MODEL` — must be a 1024-dim model (mxbai-embed-large-v1) matching the DB schema |
 | `connection refused` from server to DB | DB healthcheck hasn't passed yet — wait and retry |
 | Port 8000 already in use | Set `PORT=8001` (or another free port) in `docker/.env` |

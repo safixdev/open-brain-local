@@ -1,5 +1,5 @@
 # docker/docker-compose.yml
-# Open Brain — docker-compose stack (no Supabase, Ollama-only)
+# Open Brain — docker-compose stack (pgvector + TEI embeddings + MCP server)
 #
 # Prerequisites:
 #   cp .env.example .env
@@ -9,7 +9,9 @@
 # Start:
 #   docker compose up -d
 #
-# First run pulls ~4 GB of Ollama models; the server waits until the pull completes.
+# On first run TEI loads the embedding model (~0.67 GB); the server waits until
+# tei is healthy. Behind a proxy that blocks HF's CDN, pre-fetch the model into
+# ./tei-model and set EMBED_MODEL=/model (see the open-brain-up skill).
 
 services:
   db:
@@ -30,35 +32,44 @@ services:
       retries: 10
     restart: unless-stopped
 
-  ollama:
-    image: ollama/ollama
+  # Embedding backend: HuggingFace Text Embeddings Inference (CPU, Rust).
+  # ~343 MB image vs Ollama's ~4 GB. Serves an OpenAI-compatible /v1/embeddings.
+  # Apple Silicon / arm64 hosts: set TEI_IMAGE to the cpu-arm64 tag in .env.
+  tei:
+    image: "${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}"
+    command:
+      - "--model-id"
+      - "${EMBED_MODEL:-mixedbread-ai/mxbai-embed-large-v1}"
+      - "--port"
+      - "8080"
+      - "--auto-truncate"
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+      # Xet CDN (us.aws.cdn.hf.co) is often blocked by corporate TLS proxies;
+      # disabling it routes weight downloads through huggingface.co directly.
+      HF_HUB_DISABLE_XET: "1"
     volumes:
-      - openbrain-ollama-data:/root/.ollama
+      - openbrain-tei-data:/data
+      # Air-gapped / corp-proxy networks that block HF's CDN: pre-fetch the model
+      # on the host into ${TEI_MODEL_DIR} and set EMBED_MODEL=/model (see README).
+      # On open networks leave EMBED_MODEL as the HF id and this mount is unused.
+      - "${TEI_MODEL_DIR:-./tei-model}:/model:ro"
     healthcheck:
-      test: ["CMD", "ollama", "list"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 10s
-      timeout: 10s
-      retries: 12
-      start_period: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
     restart: unless-stopped
 
-  ollama-pull:
-    image: ollama/ollama
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      OLLAMA_HOST: "http://ollama:11434"
-      EMBED_MODEL: "${EMBED_MODEL:-mxbai-embed-large}"
-    entrypoint:
-      - sh
-      - -c
-      - "ollama pull $${EMBED_MODEL}"
-    volumes:
-      - openbrain-ollama-data:/root/.ollama
-    restart: "no"
-
   server:
+    # Distribution:
+    #   • Build from source (option A): leave OPENBRAIN_IMAGE unset, run
+    #     `docker compose build server` — the image is tagged `openbrain-mcp-server:local`.
+    #   • Prebuilt from a registry (option B): set OPENBRAIN_IMAGE to the pushed
+    #     ref (e.g. acme.jfrog.io/openbrain-docker/openbrain-mcp-server:v1.0.0),
+    #     then `docker compose pull server && docker compose up -d --no-build`.
+    image: "${OPENBRAIN_IMAGE:-openbrain-mcp-server:local}"
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -67,8 +78,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      ollama-pull:
-        condition: service_completed_successfully
+      tei:
+        condition: service_healthy
     ports:
       - "${PORT:-8000}:8000"
     env_file:
@@ -86,7 +97,7 @@ services:
 # Defaults to /dev/null (empty) → the build secret is a no-op on clean networks.
 volumes:
   openbrain-pg-data:
-  openbrain-ollama-data:
+  openbrain-tei-data:
 
 secrets:
   ca:
