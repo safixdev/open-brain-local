@@ -70,6 +70,11 @@ export interface Db {
   // Remove every local row whose metadata.artifact_path matches. Used to enforce
   // RT tombstones — returns the number of rows deleted.
   deleteByArtifactPath(artifactPath: string): Promise<DbResult<number>>;
+
+  // Persisted autosync cursor (ISO timestamp). Survives server restarts so a
+  // reboot does not re-scan/re-download every artifact from Artifactory.
+  getSyncCursor(): Promise<DbResult<string | null>>;
+  setSyncCursor(iso: string): Promise<DbResult<null>>;
 }
 
 // ── Supabase driver ──────────────────────────────────────────────────────────
@@ -173,6 +178,22 @@ function makeSupabaseDb(): Db {
         .delete({ count: "exact" })
         .eq("metadata->>artifact_path", artifactPath);
       return { data: count ?? 0, error };
+    },
+
+    async getSyncCursor() {
+      const { data, error } = await sb()
+        .from("sync_state")
+        .select("value")
+        .eq("key", "autosync_cursor")
+        .maybeSingle();
+      return { data: (data?.value as string) ?? null, error };
+    },
+
+    async setSyncCursor(iso) {
+      const { error } = await sb()
+        .from("sync_state")
+        .upsert({ key: "autosync_cursor", value: iso });
+      return { data: null, error };
     },
   };
 }
@@ -354,6 +375,46 @@ function makePostgresDb(): Db {
           [artifactPath],
         );
         return { data: result.rowCount ?? 0, error: null };
+      } catch (e) {
+        return { data: null, error: { message: (e as Error).message } };
+      } finally {
+        client.release();
+      }
+    },
+
+    async getSyncCursor() {
+      const client = await pool.connect();
+      try {
+        // Lazily ensure the table exists so existing deploys upgrade without a
+        // DB reset (the server connects as postgres, so DDL is permitted).
+        await client.queryObject(
+          `CREATE TABLE IF NOT EXISTS sync_state (
+             key text PRIMARY KEY,
+             value text NOT NULL,
+             updated_at timestamptz DEFAULT now()
+           )`,
+        );
+        const result = await client.queryObject<{ value: string }>(
+          `SELECT value FROM sync_state WHERE key = 'autosync_cursor' LIMIT 1`,
+        );
+        return { data: result.rows[0]?.value ?? null, error: null };
+      } catch (e) {
+        return { data: null, error: { message: (e as Error).message } };
+      } finally {
+        client.release();
+      }
+    },
+
+    async setSyncCursor(iso) {
+      const client = await pool.connect();
+      try {
+        await client.queryObject(
+          `INSERT INTO sync_state (key, value, updated_at)
+           VALUES ('autosync_cursor', $1, now())
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+          [iso],
+        );
+        return { data: null, error: null };
       } catch (e) {
         return { data: null, error: { message: (e as Error).message } };
       } finally {

@@ -35,19 +35,19 @@ cp .env.example .env
 cp .env.secrets.example .env.secrets
 ```
 
-### 3. Set secrets in `.env.secrets`
+### 3. Set the secret in `.env.secrets`
 
 ```bash
-# Generate strong random values:
-openssl rand -hex 32   # paste as MCP_ACCESS_KEY
 openssl rand -hex 32   # paste as POSTGRES_PASSWORD
 ```
 
 Edit `docker/.env.secrets`:
 ```
-MCP_ACCESS_KEY=<your 64-hex key>
 POSTGRES_PASSWORD=<your 64-hex password>
 ```
+
+> The MCP endpoint has no auth and binds to `127.0.0.1` only — it's a private
+> per-developer service. Shared-memory access control lives in Artifactory.
 
 ### 4. (Optional) Review non-secret config in `.env`
 
@@ -94,17 +94,20 @@ docker compose logs -f server
 Once `server` is healthy, set your key and run:
 
 ```bash
-KEY=$(grep MCP_ACCESS_KEY .env.secrets | cut -d= -f2)
-BASE="http://localhost:8000"
+PORT=$(grep -E '^PORT=' .env | cut -d= -f2); PORT=${PORT:-8787}
+BASE="http://localhost:${PORT}"
 
-# Capture a thought
-curl -s -X POST "${BASE}/?key=${KEY}" \
+# Liveness
+curl -s "${BASE}/health"   # -> {"status":"ok"}
+
+# Capture a thought (no auth header — endpoint is loopback-only)
+curl -s -X POST "${BASE}/" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture_thought","arguments":{"content":"Docker smoke test from Open Brain"}}}'
 
 # Search for it
-curl -s -X POST "${BASE}/?key=${KEY}" \
+curl -s -X POST "${BASE}/" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_thoughts","arguments":{"query":"docker smoke test"}}}'
@@ -124,7 +127,7 @@ Expected:
 ```bash
 jq '.mcpServers["open-brain"] = {
   "type": "http",
-  "url": "http://localhost:8000/?key=YOUR_MCP_ACCESS_KEY"
+  "url": "http://localhost:8787/"
 }' ~/.claude.json > /tmp/.claude.json.new && mv /tmp/.claude.json.new ~/.claude.json
 ```
 
@@ -139,7 +142,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "open-brain": {
       "type": "http",
-      "url": "http://localhost:8000/?key=YOUR_MCP_ACCESS_KEY"
+      "url": "http://localhost:8787/"
     }
   }
 }
@@ -190,4 +193,4 @@ docker compose ps
 | `tei` pull fails with `manifest unknown` | arm64 host — set `TEI_IMAGE=...:cpu-arm64-latest` |
 | `expected 1024 dimensions` error | Wrong `EMBED_MODEL` — must be a 1024-dim model (mxbai-embed-large-v1) matching the DB schema |
 | `connection refused` from server to DB | DB healthcheck hasn't passed yet — wait and retry |
-| Port 8000 already in use | Set `PORT=8001` (or another free port) in `docker/.env` |
+| Port 8787 already in use | Set a free `PORT=` in `docker/.env`, then `docker compose up -d` |

@@ -22,6 +22,14 @@ CREATE INDEX ON thoughts USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX ON thoughts USING gin (metadata);
 CREATE INDEX ON thoughts (created_at DESC);
 
+-- Small key/value store for server state. Currently holds the autosync cursor so
+-- restarts resume incremental sync instead of re-scanning the whole RT repo.
+CREATE TABLE IF NOT EXISTS sync_state (
+  key text PRIMARY KEY,
+  value text NOT NULL,
+  updated_at timestamptz DEFAULT now()
+);
+
 CREATE OR REPLACE FUNCTION update_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN

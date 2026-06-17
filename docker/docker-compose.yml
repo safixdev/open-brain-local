@@ -80,8 +80,11 @@ services:
         condition: service_healthy
       tei:
         condition: service_healthy
+    # Bound to loopback only: the MCP endpoint is a private, per-developer detail.
+    # Sharing happens via Artifactory (the SOT), not this port. To expose it on a
+    # network you MUST add auth + TLS at an ingress first.
     ports:
-      - "${PORT:-8000}:8000"
+      - "127.0.0.1:${PORT:-8787}:8000"
     env_file:
       - .env
       - .env.secrets
@@ -89,6 +92,13 @@ services:
       JF_PATH: /usr/local/bin/jf
     volumes:
       - ./jfrog-config:/home/deno/.jfrog:ro
+    healthcheck:
+      # `deno eval` runs with implicit permissions, so no --allow-net flag.
+      test: ["CMD", "deno", "eval", "const r=await fetch('http://localhost:8000/health').catch(()=>null);Deno.exit(r&&r.ok?0:1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
 # Build-time CA for the server image. Behind a corporate TLS proxy, set

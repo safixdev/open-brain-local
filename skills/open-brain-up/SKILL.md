@@ -70,10 +70,13 @@ JFROG_CLI_HOME_DIR="$PWD/jfrog-config" jf rt search "$RT_REPO/thoughts/*.json" -
 ```bash
 cp .env.example .env
 cp .env.secrets.example .env.secrets
-# secrets:
-openssl rand -hex 32   # -> MCP_ACCESS_KEY in .env.secrets
+# secret:
 openssl rand -hex 32   # -> POSTGRES_PASSWORD in .env.secrets
 ```
+
+> The MCP endpoint has no auth and is bound to `127.0.0.1` only — it's a private
+> per-developer service. Shared-memory access control lives in Artifactory (RT
+> repo permissions + the access token), not on this port.
 
 Edit `.env` and set `JF_SERVER_ID`, `RT_REPO`, `GIT_USER`, and `PORT` (default
 `8787`) to match the inputs above. `.env` / `.env.secrets` / `jfrog-config/` are
@@ -152,18 +155,20 @@ docker compose logs -f server   # expect: "Listening on http://0.0.0.0:8000/"
 ## 5. Verify (health + round trip)
 
 ```bash
-KEY=$(grep MCP_ACCESS_KEY .env.secrets | cut -d= -f2)
 PORT=$(grep -E '^PORT=' .env | cut -d= -f2); PORT=${PORT:-8787}
 BASE="http://localhost:${PORT}"
 
-# capture (agent supplies metadata)
+# liveness
+curl -s "$BASE/health"   # -> {"status":"ok"}
+
+# capture (agent supplies metadata; endpoint has no auth, localhost-only)
 curl -s -X POST "$BASE/" -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' -H "x-brain-key: $KEY" \
+  -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture_thought","arguments":{"content":"open-brain-up smoke test","type":"observation","topics":["smoke-test"],"source":"user"}}}'
 
 # search it back
 curl -s -X POST "$BASE/" -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' -H "x-brain-key: $KEY" \
+  -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_thoughts","arguments":{"query":"smoke test"}}}'
 ```
 
@@ -179,9 +184,9 @@ an audit trail).
 
 ## 6. Wire up an MCP client
 
-Point the client at `http://localhost:<PORT>/` with header `x-brain-key: <MCP_ACCESS_KEY>`.
-Four tools appear: `capture_thought`, `search_thoughts`, `list_thoughts`,
-`delete_thought`.
+Point the client at `http://localhost:<PORT>/` (no auth header needed — the
+endpoint is loopback-only). Four tools appear: `capture_thought`,
+`search_thoughts`, `list_thoughts`, `delete_thought`.
 
 ## Troubleshooting
 

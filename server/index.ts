@@ -18,8 +18,6 @@ import {
   removeTombstone,
 } from "./artifactory.ts";
 
-const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
-
 // --- MCP Server Setup ---
 
 const server = new McpServer({
@@ -326,7 +324,13 @@ server.registerTool(
   }
 );
 
-// --- Hono App with Auth + CORS ---
+// --- Hono App (CORS only) ---
+//
+// There is intentionally NO endpoint auth here. The server is bound to loopback
+// (see docker-compose `127.0.0.1:...`) and is a private, per-developer detail —
+// sharing happens via Artifactory (the SOT), governed by RT repo permissions and
+// the access token in jfrog-config. If you ever expose this on a network, add
+// auth + TLS at an ingress; do not rely on this process for access control.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -335,6 +339,10 @@ const corsHeaders = {
 };
 
 const app = new Hono();
+
+// Liveness probe (used by the container healthcheck). Must be declared before the
+// catch-all so it isn't swallowed by the MCP transport handler.
+app.get("/health", (c) => c.json({ status: "ok" }));
 
 // CORS preflight — required for browser/Electron-based clients (Claude Desktop, claude.ai)
 app.options("*", (c) => {
@@ -364,16 +372,39 @@ app.all("*", async (c) => {
 });
 
 // --- Autosync: Artifactory → Postgres every 5 minutes ---
-// In-memory cursor: advances after each successful run so only genuinely new
-// Artifactory artifacts are fetched. Resets to epoch on server restart (safe —
-// upsert_thought is idempotent; hasEmbedding skips re-embedding).
+// The cursor advances after each successful run so only genuinely new Artifactory
+// artifacts are fetched. It is persisted in Postgres (sync_state) and restored on
+// startup, so a restart does not re-scan/re-download the entire repo. A fresh DB
+// starts at epoch (safe — upsert_thought is idempotent; hasEmbedding skips
+// re-embedding), then converges after the first run.
 
 const AUTOSYNC_INTERVAL_MS = parseInt(
   Deno.env.get("AUTOSYNC_INTERVAL_MS") ?? String(5 * 60 * 1000),
 );
-let _syncCursor = "1970-01-01T00:00:00.000Z";
+const EPOCH = "1970-01-01T00:00:00.000Z";
+let _syncCursor = EPOCH;
+let _cursorLoaded = false;
+
+// Restore the persisted cursor once, before the first sync runs.
+async function loadCursor(): Promise<void> {
+  if (_cursorLoaded) return;
+  try {
+    const { data, error } = await db.getSyncCursor();
+    if (error) {
+      console.error("[autosync] cursor load failed (starting at epoch):", error.message);
+    } else if (data) {
+      _syncCursor = data;
+      console.log(`[autosync] cursor restored → ${_syncCursor.slice(0, 19)}`);
+    }
+  } catch (err) {
+    console.error("[autosync] cursor load threw (starting at epoch):", (err as Error).message);
+  }
+  _cursorLoaded = true;
+}
 
 async function runAutoSync(): Promise<void> {
+  await loadCursor();
+
   // Reconcile tombstones first (independent of the diff cursor — a tombstone can
   // target an artifact created long before the cursor). Any memory that has been
   // tombstoned in RT is removed from pgvector here, and skipped during indexing.
@@ -434,8 +465,11 @@ async function runAutoSync(): Promise<void> {
     }
   }
 
-  // Advance cursor to now — next run fetches only artifacts created after this point.
+  // Advance cursor to now — next run fetches only artifacts created after this
+  // point — and persist it so a restart resumes here instead of re-scanning all.
   _syncCursor = new Date().toISOString();
+  const { error: saveErr } = await db.setSyncCursor(_syncCursor);
+  if (saveErr) console.error("[autosync] cursor persist failed:", saveErr.message);
   console.log(`[autosync] cursor → ${_syncCursor.slice(0, 19)}`);
 }
 
