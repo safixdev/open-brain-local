@@ -4,9 +4,19 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
-import { getEmbedding, extractMetadata } from "./llm.ts";
+import { getEmbedding } from "./llm.ts";
 import { db } from "./db.ts";
-import { diffSince, fetchArtifact, probeRtRoot, pushArtifact } from "./artifactory.ts";
+import {
+  artifactIdForContent,
+  deleteArtifact,
+  diffSince,
+  fetchArtifact,
+  listTombstones,
+  probeRtRoot,
+  pushArtifact,
+  pushTombstone,
+  removeTombstone,
+} from "./artifactory.ts";
 
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
@@ -334,7 +344,7 @@ server.registerTool(
   {
     title: "Capture Thought",
     description:
-      "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
+      "Save a new memory to the Open Brain. YOU (the calling agent) own the metadata: extract it yourself and pass it in — the server does NOT run any LLM to infer it. Write `content` as a clear, standalone statement that will make sense out of context later. Set `type`, `topics`, `people`, `action_items`, and `dates_mentioned` (absolute YYYY-MM-DD) from your understanding of the conversation. Set `source` to 'user' when the user explicitly asked to remember something, or 'agent-inferred' when you are proactively capturing a durable fact you noticed. The server only generates the embedding (for search) and stores the artifact.",
     annotations: {
       readOnlyHint: false,
       openWorldHint: false,
@@ -342,40 +352,57 @@ server.registerTool(
       idempotentHint: false,
     },
     inputSchema: {
-      content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      content: z.string().describe("The memory to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      type: z
+        .enum(["observation", "task", "idea", "reference", "person_note"])
+        .optional()
+        .describe("The kind of memory. Defaults to 'observation' if omitted."),
+      topics: z.array(z.string()).optional().describe("1-3 short topic tags you assign to this memory."),
+      people: z.array(z.string()).optional().describe("People mentioned in or relevant to this memory."),
+      action_items: z.array(z.string()).optional().describe("Concrete to-dos implied by this memory."),
+      dates_mentioned: z.array(z.string()).optional().describe("Absolute dates (YYYY-MM-DD) you resolved from the content."),
+      source: z
+        .string()
+        .optional()
+        .describe("Origin/trust of this memory: 'user' (the user asked to remember it), 'agent-inferred' (you captured it proactively), or another label. Defaults to 'mcp'."),
+      git_user: z.string().optional().describe("Git username of the person/agent capturing this memory (e.g. from `git config user.name`). Falls back to the server default if omitted."),
+      repo: z.string().optional().describe("The git repository the memory was captured in, e.g. 'context_as_artifacts'."),
+      context: z.string().optional().describe("Optional short note on the context/situation in which this was captured (e.g. the task or file being worked on)."),
     },
   },
-  async ({ content }) => {
+  async ({ content, type, topics, people, action_items, dates_mentioned, source, git_user, repo, context }) => {
     try {
-      const [, metadata] = await Promise.all([
-        Promise.resolve(null),
-        extractMetadata(content),
-      ]);
+      // Metadata is supplied by the calling agent — no server-side LLM extraction.
+      // Fall back to minimal defaults only for the structural fields.
+      const metadata: Record<string, unknown> = {
+        type: type ?? "observation",
+        topics: topics && topics.length ? topics : ["uncategorized"],
+        ...(people && people.length ? { people } : {}),
+        ...(action_items && action_items.length ? { action_items } : {}),
+        ...(dates_mentioned && dates_mentioned.length ? { dates_mentioned } : {}),
+      };
 
       // Push to Artifactory (SOT). pgvector is populated exclusively via sync.
-      const rtMeta = metadata as Record<string, unknown>;
-      const artifactId = await (async () => {
-        const buf = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
-        return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
-      })();
+      const artifactId = await artifactIdForContent(content);
       await pushArtifact({
         id: artifactId,
         content,
-        metadata: { ...rtMeta, source: "mcp" },
+        metadata: { ...metadata, source: source ?? "mcp", git_user, repo, context },
         created_at: new Date().toISOString(),
       });
+
+      // Resurrect: drop any stale tombstone for this content so a re-captured
+      // memory is not removed again by the tombstone-reconcile step.
+      await removeTombstone(artifactId);
 
       // Sync immediately so the new artifact lands in pgvector before we return.
       await runAutoSync();
 
-      const meta = metadata as Record<string, unknown>;
-      let confirmation = `Captured as ${meta.type || "thought"}`;
-      if (Array.isArray(meta.topics) && meta.topics.length)
-        confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
-      if (Array.isArray(meta.people) && meta.people.length)
-        confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
-      if (Array.isArray(meta.action_items) && meta.action_items.length)
-        confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+      let confirmation = `Captured as ${metadata.type}`;
+      const tags = metadata.topics as string[];
+      if (tags.length) confirmation += ` — ${tags.join(", ")}`;
+      if (people && people.length) confirmation += ` | People: ${people.join(", ")}`;
+      if (action_items && action_items.length) confirmation += ` | Actions: ${action_items.join("; ")}`;
 
       return {
         content: [{ type: "text" as const, text: confirmation }],
@@ -389,7 +416,80 @@ server.registerTool(
   }
 );
 
-// Tool 5: Trigger Sync
+// Tool 5: Delete Thought
+server.registerTool(
+  "delete_thought",
+  {
+    title: "Delete Thought",
+    description:
+      "Delete a captured memory. Writes a tombstone to Artifactory (a durable trace of what was deleted, when, and by whom), removes the live artifact, and deletes the memory from the local pgvector index. The tombstone makes the deletion stick across future syncs and other clients. Identify the memory by its artifact id (sha256, shown as artifact_path 'thoughts/<id>.json' / by list_rt_memories) or by its exact content.",
+    annotations: {
+      readOnlyHint: false,
+      openWorldHint: true,
+      destructiveHint: true,
+      idempotentHint: true,
+    },
+    inputSchema: {
+      id: z
+        .string()
+        .optional()
+        .describe("The artifact id (sha256) of the memory to delete, e.g. from artifact_path 'thoughts/<id>.json'."),
+      content: z
+        .string()
+        .optional()
+        .describe("The exact memory content to delete (used to compute the artifact id when `id` is not given)."),
+      git_user: z
+        .string()
+        .optional()
+        .describe("Git username of who is deleting, recorded in the tombstone trace. Falls back to the server default."),
+    },
+  },
+  async ({ id, content, git_user }) => {
+    try {
+      let artId = id;
+      if (!artId && content) artId = await artifactIdForContent(content);
+      if (!artId) {
+        return {
+          content: [{ type: "text" as const, text: "Error: provide either `id` or `content`." }],
+          isError: true,
+        };
+      }
+
+      // Best-effort: fetch original content for the tombstone trace if not given.
+      let original = content;
+      if (!original) {
+        try {
+          original = (await fetchArtifact(`thoughts/${artId}.json`)).content;
+        } catch {
+          // Artifact may already be gone — tombstone without a snippet.
+        }
+      }
+
+      // 1. Write the tombstone (trace). 2. Remove the live artifact. 3. Drop from pgvector.
+      await pushTombstone(artId, { git_user, content: original });
+      await deleteArtifact(artId).catch(() => {});
+      const { data: removed } = await db.deleteByArtifactPath(`thoughts/${artId}.json`);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Deleted memory ${artId.slice(0, 12)}. Removed ${removed ?? 0} row(s) from pgvector. ` +
+              `Trace kept at thoughts/${artId}.deleted.json.`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Delete error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 6: Trigger Sync
 server.registerTool(
   "trigger_sync",
   {
@@ -489,6 +589,23 @@ const AUTOSYNC_INTERVAL_MS = parseInt(
 let _syncCursor = "1970-01-01T00:00:00.000Z";
 
 async function runAutoSync(): Promise<void> {
+  // Reconcile tombstones first (independent of the diff cursor — a tombstone can
+  // target an artifact created long before the cursor). Any memory that has been
+  // tombstoned in RT is removed from pgvector here, and skipped during indexing.
+  let tombstonedIds = new Set<string>();
+  try {
+    const tombstones = await listTombstones();
+    tombstonedIds = new Set(tombstones.map((t) => t.id));
+    for (const t of tombstones) {
+      const { data: removed } = await db.deleteByArtifactPath(`thoughts/${t.id}.json`);
+      if (removed && removed > 0) {
+        console.log(`[autosync] tombstone enforced — removed ${t.id.slice(0, 12)} from pgvector`);
+      }
+    }
+  } catch (err) {
+    console.error("[autosync] tombstone reconcile failed:", (err as Error).message);
+  }
+
   const newArtifacts = await diffSince(_syncCursor);
 
   if (!newArtifacts.length) {
@@ -499,6 +616,12 @@ async function runAutoSync(): Promise<void> {
   console.log(`[autosync] ${newArtifacts.length} new artifact(s) since ${_syncCursor.slice(0, 19)}`);
 
   for (const { path } of newArtifacts) {
+    // Never index a tombstoned memory.
+    const artId = path.split("/").pop()!.replace(/\.json$/, "");
+    if (tombstonedIds.has(artId)) {
+      console.log(`[autosync] skip tombstoned: ${artId.slice(0, 12)}`);
+      continue;
+    }
     try {
       const artifact = await fetchArtifact(path);
 

@@ -66,6 +66,10 @@ export interface Db {
   updateEmbedding(id: string, embedding: number[]): Promise<DbResult<null>>;
 
   hasEmbedding(id: string): Promise<DbResult<boolean>>;
+
+  // Remove every local row whose metadata.artifact_path matches. Used to enforce
+  // RT tombstones — returns the number of rows deleted.
+  deleteByArtifactPath(artifactPath: string): Promise<DbResult<number>>;
 }
 
 // ── Supabase driver ──────────────────────────────────────────────────────────
@@ -161,6 +165,14 @@ function makeSupabaseDb(): Db {
         .eq("id", id)
         .single();
       return { data: data ? data.embedding !== null : false, error };
+    },
+
+    async deleteByArtifactPath(artifactPath) {
+      const { error, count } = await sb()
+        .from("thoughts")
+        .delete({ count: "exact" })
+        .eq("metadata->>artifact_path", artifactPath);
+      return { data: count ?? 0, error };
     },
   };
 }
@@ -327,6 +339,21 @@ function makePostgresDb(): Db {
           [id],
         );
         return { data: result.rows[0]?.has_embedding ?? false, error: null };
+      } catch (e) {
+        return { data: null, error: { message: (e as Error).message } };
+      } finally {
+        client.release();
+      }
+    },
+
+    async deleteByArtifactPath(artifactPath) {
+      const client = await pool.connect();
+      try {
+        const result = await client.queryObject(
+          `DELETE FROM thoughts WHERE metadata->>'artifact_path' = $1`,
+          [artifactPath],
+        );
+        return { data: result.rowCount ?? 0, error: null };
       } catch (e) {
         return { data: null, error: { message: (e as Error).message } };
       } finally {
