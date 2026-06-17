@@ -50,11 +50,10 @@ services:
     environment:
       OLLAMA_HOST: "http://ollama:11434"
       EMBED_MODEL: "${EMBED_MODEL:-mxbai-embed-large}"
-      CHAT_MODEL: "${CHAT_MODEL:-gemma3:4b}"
     entrypoint:
       - sh
       - -c
-      - "ollama pull $${EMBED_MODEL} && ollama pull $${CHAT_MODEL}"
+      - "ollama pull $${EMBED_MODEL}"
     volumes:
       - openbrain-ollama-data:/root/.ollama
     restart: "no"

@@ -1,6 +1,10 @@
 # Open Brain — Docker Compose Stack
 
-Run Open Brain fully in containers: Postgres + pgvector, Ollama (embeddings + chat), and the MCP server — no Supabase, no API keys, no cloud.
+Run Open Brain fully in containers: Postgres + pgvector, Ollama (embeddings only), and the MCP server. Artifactory is the source of truth for memories; pgvector is a rebuildable search index synced from it.
+
+> Metadata (topics, type, people, …) is supplied by the **calling agent** via `capture_thought` — this stack runs **no chat model**. The only model is the embedding model.
+
+> **Operators:** the canonical install/startup runbook is the `open-brain-up` skill (`skills/open-brain-up/`). This README is the reference; the skill is the procedure.
 
 ---
 
@@ -46,10 +50,14 @@ POSTGRES_PASSWORD=<your 64-hex password>
 
 ### 4. (Optional) Review non-secret config in `.env`
 
-The defaults in `.env` work out of the box:
-- `EMBED_MODEL=mxbai-embed-large` — 1024-dim embedding model
-- `CHAT_MODEL=gemma3:4b` — metadata extraction model
-- `PORT=8000` — host port for the MCP server
+The defaults in `.env` work out of the box, but set these for your team:
+- `EMBED_MODEL=mxbai-embed-large` — 1024-dim embedding model (the only model)
+- `PORT=8787` — host port for the MCP server
+- `JF_SERVER_ID` / `RT_REPO` — your Artifactory server-id and memories repo
+- `GIT_USER` — fallback pusher identity recorded on memories
+
+You must also provide Artifactory credentials for the `jf` CLI — see the
+`open-brain-up` skill for the `jf config add` + mount step.
 
 ### 5. Start the stack
 
@@ -131,10 +139,10 @@ Restart Claude Desktop.
 | State | RAM |
 |---|---|
 | Stack idle (db + ollama, no model loaded) | ~400 MB |
-| Active capture (both models loaded) | ~4.5 GB peak |
-| 5+ min idle (Ollama auto-unloads models) | ~500 MB |
+| Active capture/search (embedding model loaded) | ~1.5 GB peak |
+| 5+ min idle (Ollama auto-unloads the model) | ~500 MB |
 
-RAM drops automatically after 5 minutes of inactivity as Ollama unloads models.
+RAM drops automatically after 5 minutes of inactivity as Ollama unloads the model.
 
 ---
 
