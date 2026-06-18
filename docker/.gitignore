@@ -1,0 +1,6 @@
+jfrog-config/
+openbrain-data/
+.env.secrets
+tei-model/
+*.pem
+dist/

@@ -4,24 +4,21 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
-import { getEmbedding, extractMetadata } from "./llm.ts";
+import { getEmbedding } from "./llm.ts";
 import { db } from "./db.ts";
-import { diffSince, fetchArtifact } from "./artifactory.ts";
-
-const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
-
-const CITATION_BASE_URL =
-  Deno.env.get("OPEN_BRAIN_CITATION_BASE_URL") || "https://openbrain.local/thoughts";
-
-function thoughtTitle(content: string, createdAt?: string): string {
-  const firstLine = content.replace(/\s+/g, " ").trim().slice(0, 80);
-  const datePrefix = createdAt ? new Date(createdAt).toLocaleDateString() : "Open Brain";
-  return firstLine ? `${datePrefix} - ${firstLine}` : `${datePrefix} thought`;
-}
-
-function thoughtUrl(id: string): string {
-  return `${CITATION_BASE_URL.replace(/\/$/, "")}/${id}`;
-}
+import {
+  artifactIdForContent,
+  deleteArtifact,
+  fetchArtifact,
+  listArtifacts,
+  listTombstones,
+  liveSubPath,
+  probeRtRoot,
+  pushArtifact,
+  pushTombstone,
+  removeTombstone,
+  repoFolder,
+} from "./artifactory.ts";
 
 // --- MCP Server Setup ---
 
@@ -30,109 +27,13 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-// ChatGPT compatibility: restricted connector surfaces, company knowledge, and deep
-// research look for exact read-only `search` and `fetch` tool shapes.
+// search — semantic recall, repo-scoped by default.
 server.registerTool(
-  "search",
+  "search_memories",
   {
-    title: "Search Open Brain",
+    title: "Search Memories",
     description:
-      "Search Open Brain memories by meaning. Use this read-only compatibility tool when ChatGPT needs search/fetch-style access to stored thoughts.",
-    annotations: {
-      readOnlyHint: true,
-    },
-    inputSchema: {
-      query: z.string().describe("The search query to run against Open Brain thoughts"),
-    },
-  },
-  async ({ query }) => {
-    try {
-      const qEmb = await getEmbedding(query);
-      const { data, error } = await db.matchThoughts(qEmb, 0.5, 10, {});
-
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
-          isError: true,
-        };
-      }
-
-      const results = ((data || []) as { id: string; content: string; created_at: string }[]).map(
-        (t) => ({
-          id: t.id,
-          title: thoughtTitle(t.content, t.created_at),
-          url: thoughtUrl(t.id),
-        })
-      );
-
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-server.registerTool(
-  "fetch",
-  {
-    title: "Fetch Open Brain Thought",
-    description:
-      "Fetch one Open Brain thought by ID after using search. Use this read-only compatibility tool to retrieve the full text and metadata for citation.",
-    annotations: {
-      readOnlyHint: true,
-    },
-    inputSchema: {
-      id: z.string().describe("The Open Brain thought ID returned by the search tool"),
-    },
-  },
-  async ({ id }) => {
-    try {
-      const { data, error } = await db.getThoughtById(id);
-
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Fetch error: ${error.message}` }],
-          isError: true,
-        };
-      }
-
-      const thought = data!;
-      const document = {
-        id: thought.id,
-        title: thoughtTitle(thought.content, thought.created_at),
-        text: thought.content,
-        url: thoughtUrl(thought.id),
-        metadata: {
-          ...thought.metadata,
-          created_at: thought.created_at,
-          updated_at: thought.updated_at,
-        },
-      };
-
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(document) }],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool 1: Semantic Search
-server.registerTool(
-  "search_thoughts",
-  {
-    title: "Search Thoughts",
-    description:
-      "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured.",
+      "Recall stored memories via semantic search. USE PROACTIVELY and FIRST — before answering or acting — whenever the request touches anything that could be remembered. Triggers (non-exhaustive): the user references prior context ('remember', 'recall', 'as we discussed', 'last time', 'previously', 'earlier', 'what did we decide', 'do we have', 'have we', 'did I/we', 'what do you know about'); asks you to VERIFY, check, confirm, or cross-reference against what's known; asks a question whose answer may depend on past decisions, conventions, preferences, identities, or project facts; or you're starting a task that could benefit from prior knowledge. When in doubt, search — a missed recall is worse than an empty result. Pass `repo` to scope to your current project; set `all_repos` for global recall.",
     annotations: {
       readOnlyHint: true,
     },
@@ -140,12 +41,31 @@ server.registerTool(
       query: z.string().describe("What to search for"),
       limit: z.number().optional().default(10),
       threshold: z.number().optional().default(0.5),
+      repo: z
+        .string()
+        .optional()
+        .describe("Scope results to memories captured in this git repo. Pass the repo you are currently working in so you don't surface memories from unrelated projects."),
+      all_repos: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Search across ALL repos this client has cached, ignoring `repo`. Use only when the user explicitly asks for cross-repo / global memory. Note: only repos previously captured-to or searched are cached locally."),
     },
   },
-  async ({ query, limit, threshold }) => {
+  async ({ query, limit, threshold, repo, all_repos }) => {
     try {
+      // Repo-scoped cache: if this is the first time we see `repo`, add it to the
+      // scope and backfill it now so this very search can return its memories.
+      if (repo && !all_repos) {
+        const isNew = await addRepoToScope(repo);
+        if (isNew) await syncRepo(repo);
+      }
+
       const qEmb = await getEmbedding(query);
-      const { data, error } = await db.matchThoughts(qEmb, threshold, limit, {});
+      // Repo scoping: filter to the agent's current repo unless cross-repo is
+      // explicitly requested. metadata @> {repo} is applied by match_thoughts.
+      const filter = repo && !all_repos ? { repo } : {};
+      const { data, error } = await db.matchThoughts(qEmb, threshold, limit, filter);
 
       if (error) {
         return {
@@ -154,9 +74,11 @@ server.registerTool(
         };
       }
 
+      const scopeNote = repo && !all_repos ? ` in repo "${repo}"` : all_repos ? " across all repos" : "";
+
       if (!data || data.length === 0) {
         return {
-          content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }],
+          content: [{ type: "text" as const, text: `No memories found matching "${query}"${scopeNote}.` }],
         };
       }
 
@@ -186,7 +108,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `Found ${data.length} thought(s):\n\n${results.join("\n\n")}`,
+            text: `Found ${data.length} memory(ies)${scopeNote}:\n\n${results.join("\n\n")}`,
           },
         ],
       };
@@ -199,13 +121,13 @@ server.registerTool(
   }
 );
 
-// Tool 2: List Recent
+// list — browse recent memories with optional filters.
 server.registerTool(
-  "list_thoughts",
+  "list_memories",
   {
-    title: "List Recent Thoughts",
+    title: "List Recent Memories",
     description:
-      "List recently captured thoughts with optional filters by type, topic, person, or time range.",
+      "Browse recent memories (chronological), optionally filtered by type, topic, person, or last N days. Use when the user asks what's been remembered/captured lately ('what do we have', 'show recent notes', 'what have we saved'). For topical recall prefer `search_memories`.",
     annotations: {
       readOnlyHint: true,
     },
@@ -214,7 +136,7 @@ server.registerTool(
       type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
       topic: z.string().optional().describe("Filter by topic tag"),
       person: z.string().optional().describe("Filter by person mentioned"),
-      days: z.number().optional().describe("Only thoughts from the last N days"),
+      days: z.number().optional().describe("Only memories from the last N days"),
     },
   },
   async ({ limit, type, topic, person, days }) => {
@@ -229,7 +151,7 @@ server.registerTool(
       }
 
       if (!data || !data.length) {
-        return { content: [{ type: "text" as const, text: "No thoughts found." }] };
+        return { content: [{ type: "text" as const, text: "No memories found." }] };
       }
 
       const results = data.map(
@@ -247,7 +169,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `${data.length} recent thought(s):\n\n${results.join("\n\n")}`,
+            text: `${data.length} recent memory(ies):\n\n${results.join("\n\n")}`,
           },
         ],
       };
@@ -260,81 +182,13 @@ server.registerTool(
   }
 );
 
-// Tool 3: Stats
+// capture — save a memory. The agent owns the metadata (no server-side LLM).
 server.registerTool(
-  "thought_stats",
+  "capture_memory",
   {
-    title: "Thought Statistics",
-    description: "Get a summary of all captured thoughts: totals, types, top topics, and people.",
-    annotations: {
-      readOnlyHint: true,
-    },
-    inputSchema: {},
-  },
-  async () => {
-    try {
-      const { data: count } = await db.countThoughts();
-      const { data } = await db.allThoughtsMeta();
-
-      const types: Record<string, number> = {};
-      const topics: Record<string, number> = {};
-      const people: Record<string, number> = {};
-
-      for (const r of data || []) {
-        const m = (r.metadata || {}) as Record<string, unknown>;
-        if (m.type) types[m.type as string] = (types[m.type as string] || 0) + 1;
-        if (Array.isArray(m.topics))
-          for (const t of m.topics) topics[t as string] = (topics[t as string] || 0) + 1;
-        if (Array.isArray(m.people))
-          for (const p of m.people) people[p as string] = (people[p as string] || 0) + 1;
-      }
-
-      const sort = (o: Record<string, number>): [string, number][] =>
-        Object.entries(o)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 10);
-
-      const lines: string[] = [
-        `Total thoughts: ${count}`,
-        `Date range: ${
-          data?.length
-            ? new Date(data[data.length - 1].created_at).toLocaleDateString() +
-              " → " +
-              new Date(data[0].created_at).toLocaleDateString()
-            : "N/A"
-        }`,
-        "",
-        "Types:",
-        ...sort(types).map(([k, v]) => `  ${k}: ${v}`),
-      ];
-
-      if (Object.keys(topics).length) {
-        lines.push("", "Top topics:");
-        for (const [k, v] of sort(topics)) lines.push(`  ${k}: ${v}`);
-      }
-
-      if (Object.keys(people).length) {
-        lines.push("", "People mentioned:");
-        for (const [k, v] of sort(people)) lines.push(`  ${k}: ${v}`);
-      }
-
-      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
-    } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool 4: Capture Thought
-server.registerTool(
-  "capture_thought",
-  {
-    title: "Capture Thought",
+    title: "Capture Memory",
     description:
-      "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
+      "Save a memory for later recall. USE PROACTIVELY whenever something durable and reusable surfaces. Triggers: the user says 'remember', 'note', 'keep in mind', 'for next time', 'don't forget', 'save this', 'make a note'; OR you learn a lasting fact worth not rediscovering — a decision + rationale, a project convention/constraint/architecture choice, a user preference or identity fact, or a non-obvious gotcha. Do NOT capture transient state, secrets/tokens, or trivially re-derivable detail. You own the metadata — pass `content` as a standalone statement plus `type`/`topics`/`people`/`repo` etc. Set `source` to 'user' (explicitly asked) or 'agent-inferred' (you captured it proactively). Server only embeds + stores.",
     annotations: {
       readOnlyHint: false,
       openWorldHint: false,
@@ -342,45 +196,65 @@ server.registerTool(
       idempotentHint: false,
     },
     inputSchema: {
-      content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      content: z.string().describe("The memory to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      type: z
+        .enum(["observation", "task", "idea", "reference", "person_note"])
+        .optional()
+        .describe("The kind of memory. Defaults to 'observation' if omitted."),
+      topics: z.array(z.string()).optional().describe("1-3 short topic tags you assign to this memory."),
+      people: z.array(z.string()).optional().describe("People mentioned in or relevant to this memory."),
+      action_items: z.array(z.string()).optional().describe("Concrete to-dos implied by this memory."),
+      dates_mentioned: z.array(z.string()).optional().describe("Absolute dates (YYYY-MM-DD) you resolved from the content."),
+      source: z
+        .string()
+        .optional()
+        .describe("Origin/trust of this memory: 'user' (the user asked to remember it), 'agent-inferred' (you captured it proactively), or another label. Defaults to 'mcp'."),
+      git_user: z.string().optional().describe("Git username of the person/agent capturing this memory (e.g. from `git config user.name`). Falls back to the server default if omitted."),
+      repo: z.string().describe("REQUIRED. The git repository this memory belongs to, e.g. 'context_as_artifacts'. Memories are stored and recalled per-repo, so always pass the repo you are working in."),
+      context: z.string().optional().describe("Optional short note on the context/situation in which this was captured (e.g. the task or file being worked on)."),
     },
   },
-  async ({ content }) => {
+  async ({ content, type, topics, people, action_items, dates_mentioned, source, git_user, repo, context }) => {
     try {
-      const [embedding, metadata] = await Promise.all([
-        getEmbedding(content),
-        extractMetadata(content),
-      ]);
+      if (!repo || !repo.trim()) {
+        return {
+          content: [{ type: "text" as const, text: "Error: `repo` is required — pass the git repo this memory belongs to." }],
+          isError: true,
+        };
+      }
+      // Metadata is supplied by the calling agent — no server-side LLM extraction.
+      // Fall back to minimal defaults only for the structural fields.
+      const metadata: Record<string, unknown> = {
+        type: type ?? "observation",
+        topics: topics && topics.length ? topics : ["uncategorized"],
+        ...(people && people.length ? { people } : {}),
+        ...(action_items && action_items.length ? { action_items } : {}),
+        ...(dates_mentioned && dates_mentioned.length ? { dates_mentioned } : {}),
+      };
 
-      const { data: upsertResult, error: upsertError } = await db.upsertThought(content, {
-        metadata: { ...metadata, source: "mcp" },
+      // Push to Artifactory (SOT). pgvector is populated exclusively via sync.
+      const artifactId = await artifactIdForContent(content);
+      await pushArtifact({
+        id: artifactId,
+        content,
+        metadata: { ...metadata, source: source ?? "mcp", git_user, repo, context },
+        created_at: new Date().toISOString(),
       });
 
-      if (upsertError) {
-        return {
-          content: [{ type: "text" as const, text: `Failed to capture: ${upsertError.message}` }],
-          isError: true,
-        };
-      }
+      // Resurrect: drop any stale tombstone for this content so a re-captured
+      // memory is not removed again by the tombstone-reconcile step.
+      await removeTombstone(artifactId, repo);
 
-      const thoughtId = upsertResult?.id;
-      const { error: embError } = await db.updateEmbedding(thoughtId!, embedding);
+      // Ensure this repo is in the cache scope, then sync just this repo so the
+      // new artifact lands in pgvector before we return.
+      await addRepoToScope(repo);
+      await syncRepo(repo);
 
-      if (embError) {
-        return {
-          content: [{ type: "text" as const, text: `Failed to save embedding: ${embError.message}` }],
-          isError: true,
-        };
-      }
-
-      const meta = metadata as Record<string, unknown>;
-      let confirmation = `Captured as ${meta.type || "thought"}`;
-      if (Array.isArray(meta.topics) && meta.topics.length)
-        confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
-      if (Array.isArray(meta.people) && meta.people.length)
-        confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
-      if (Array.isArray(meta.action_items) && meta.action_items.length)
-        confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+      let confirmation = `Captured as ${metadata.type}`;
+      const tags = metadata.topics as string[];
+      if (tags.length) confirmation += ` — ${tags.join(", ")}`;
+      if (people && people.length) confirmation += ` | People: ${people.join(", ")}`;
+      if (action_items && action_items.length) confirmation += ` | Actions: ${action_items.join("; ")}`;
 
       return {
         content: [{ type: "text" as const, text: confirmation }],
@@ -394,7 +268,97 @@ server.registerTool(
   }
 );
 
-// --- Hono App with Auth + CORS ---
+// delete — tombstone in Artifactory + drop from pgvector. Identify by id or content.
+server.registerTool(
+  "delete_memory",
+  {
+    title: "Delete Memory",
+    description:
+      "Delete a memory in a given `repo` by `id` (sha256) or exact `content`. Writes a durable tombstone in Artifactory (trace of what/when/who) so the deletion sticks across syncs, then removes it from pgvector.",
+    annotations: {
+      readOnlyHint: false,
+      openWorldHint: true,
+      destructiveHint: true,
+      idempotentHint: true,
+    },
+    inputSchema: {
+      repo: z
+        .string()
+        .describe("REQUIRED. The git repo the memory belongs to (memories are stored per-repo)."),
+      id: z
+        .string()
+        .optional()
+        .describe("The artifact id (sha256) of the memory to delete, e.g. from artifact_path '<repo>/thoughts/<id>.json'."),
+      content: z
+        .string()
+        .optional()
+        .describe("The exact memory content to delete (used to compute the artifact id when `id` is not given)."),
+      git_user: z
+        .string()
+        .optional()
+        .describe("Git username of who is deleting, recorded in the tombstone trace. Falls back to the server default."),
+    },
+  },
+  async ({ repo, id, content, git_user }) => {
+    try {
+      if (!repo || !repo.trim()) {
+        return {
+          content: [{ type: "text" as const, text: "Error: `repo` is required to locate the memory." }],
+          isError: true,
+        };
+      }
+      let artId = id;
+      if (!artId && content) artId = await artifactIdForContent(content);
+      if (!artId) {
+        return {
+          content: [{ type: "text" as const, text: "Error: provide either `id` or `content`." }],
+          isError: true,
+        };
+      }
+
+      const subPath = liveSubPath(repo, artId);
+
+      // Best-effort: fetch original content for the tombstone trace if not given.
+      let original = content;
+      if (!original) {
+        try {
+          original = (await fetchArtifact(subPath)).content;
+        } catch {
+          // Artifact may already be gone — tombstone without a snippet.
+        }
+      }
+
+      // 1. Write the tombstone (trace). 2. Remove the live artifact. 3. Drop from pgvector.
+      await pushTombstone(artId, repo, { git_user, content: original });
+      await deleteArtifact(artId, repo).catch(() => {});
+      const { data: removed } = await db.deleteByArtifactPath(subPath);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Deleted memory ${artId.slice(0, 12)} from ${repo}. Removed ${removed ?? 0} row(s) from pgvector. ` +
+              `Trace kept at ${subPath.replace(/\.json$/, ".deleted.json")}.`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Delete error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Hono App (CORS only) ---
+//
+// There is intentionally NO endpoint auth here. The server is bound to loopback
+// (see docker-compose `127.0.0.1:...`) and is a private, per-developer detail —
+// sharing happens via Artifactory (the SOT), governed by RT repo permissions and
+// the access token in jfrog-config. If you ever expose this on a network, add
+// auth + TLS at an ingress; do not rely on this process for access control.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -403,6 +367,10 @@ const corsHeaders = {
 };
 
 const app = new Hono();
+
+// Liveness probe (used by the container healthcheck). Must be declared before the
+// catch-all so it isn't swallowed by the MCP transport handler.
+app.get("/health", (c) => c.json({ status: "ok" }));
 
 // CORS preflight — required for browser/Electron-based clients (Claude Desktop, claude.ai)
 app.options("*", (c) => {
@@ -431,57 +399,133 @@ app.all("*", async (c) => {
   return transport.handleRequest(c);
 });
 
-// --- Autosync: Artifactory → Postgres every 5 minutes ---
-// In-memory cursor: advances after each successful run so only genuinely new
-// Artifactory artifacts are fetched. Resets to epoch on server restart (safe —
-// upsert_thought is idempotent; hasEmbedding skips re-embedding).
+// --- Autosync: Artifactory → Postgres ---
+// Sync is REPO-SCOPED: each client only caches the repos it actually uses, so a
+// developer's local pgvector never mirrors other teams' memories. The scope set is
+// seeded from SYNC_REPOS (comma-separated) and grown lazily whenever a repo is
+// captured to / searched. Each repo has its own cursor (sync_state key
+// "cursor:<repo>") advanced to the max RT `created` timestamp actually observed —
+// RT's clock, never the client's — so local clock skew can't silently skip a
+// teammate's new memory. A fresh repo starts at epoch (full backfill);
+// upsert_thought is idempotent and hasEmbedding skips re-embeds.
 
 const AUTOSYNC_INTERVAL_MS = parseInt(
   Deno.env.get("AUTOSYNC_INTERVAL_MS") ?? String(5 * 60 * 1000),
 );
-let _syncCursor = "1970-01-01T00:00:00.000Z";
+const EPOCH = "1970-01-01T00:00:00.000Z";
 
-async function runAutoSync(): Promise<void> {
-  const newArtifacts = await diffSince(_syncCursor);
+// Repos this client caches. Seeded from SYNC_REPOS, persisted in sync_state, and
+// grown by capture_memory / search_memories.
+const _syncRepos = new Set<string>(
+  (Deno.env.get("SYNC_REPOS") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+let _scopeLoaded = false;
 
-  if (!newArtifacts.length) {
-    console.log(`[autosync] up to date (cursor: ${_syncCursor.slice(0, 19)})`);
-    return;
+async function loadScope(): Promise<void> {
+  if (_scopeLoaded) return;
+  try {
+    const { data } = await db.getSyncCursor("sync_repos");
+    if (data) {
+      for (const r of data.split(",").map((s) => s.trim()).filter(Boolean)) _syncRepos.add(r);
+    }
+  } catch (err) {
+    console.error("[autosync] scope load failed:", (err as Error).message);
+  }
+  _scopeLoaded = true;
+}
+
+// Add a repo to the cache scope. Returns true if newly added — callers backfill it
+// immediately (syncRepo) so the current request sees its data.
+async function addRepoToScope(repo: string): Promise<boolean> {
+  const r = repo.trim();
+  if (!r) return false;
+  await loadScope();
+  if (_syncRepos.has(r)) return false;
+  _syncRepos.add(r);
+  await db.setSyncCursor([..._syncRepos].join(","), "sync_repos").catch((e) =>
+    console.error("[autosync] scope persist failed:", (e as Error).message)
+  );
+  console.log(`[autosync] repo added to cache scope → ${r}`);
+  return true;
+}
+
+// Sync one repo: enforce its tombstones, then index its new artifacts.
+async function syncRepo(repo: string): Promise<void> {
+  const cursorKey = `cursor:${repoFolder(repo)}`;
+  let cursor = EPOCH;
+  const { data: saved } = await db.getSyncCursor(cursorKey);
+  if (saved) cursor = saved;
+
+  let tombstonedIds = new Set<string>();
+  try {
+    const tombstones = await listTombstones(repo);
+    tombstonedIds = new Set(tombstones.map((t) => t.id));
+    for (const t of tombstones) {
+      // The live artifact sits next to the tombstone: same path, sans ".deleted".
+      const livePath = t.path.replace(/\.deleted\.json$/, ".json");
+      const { data: removed } = await db.deleteByArtifactPath(livePath);
+      if (removed && removed > 0) {
+        console.log(`[autosync] (${repo}) tombstone enforced — removed ${t.id.slice(0, 12)}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[autosync] (${repo}) tombstone reconcile failed:`, (err as Error).message);
   }
 
-  console.log(`[autosync] ${newArtifacts.length} new artifact(s) since ${_syncCursor.slice(0, 19)}`);
+  const all = await listArtifacts(repo); // sorted asc by created
+  // Skew-safe: advance the cursor to the max RT `created` observed, not the local
+  // wall clock. `>= cursor` re-includes the boundary item (idempotent upsert).
+  let maxCreated = cursor;
+  for (const a of all) if (a.created > maxCreated) maxCreated = a.created;
+  const fresh = all.filter((a) => a.created >= cursor);
 
-  for (const { path } of newArtifacts) {
+  if (fresh.length) {
+    console.log(`[autosync] (${repo}) ${fresh.length} artifact(s) at/after ${cursor.slice(0, 19)}`);
+  }
+
+  for (const { path } of fresh) {
+    const artId = path.split("/").pop()!.replace(/\.json$/, "");
+    if (tombstonedIds.has(artId)) continue;
     try {
       const artifact = await fetchArtifact(path);
-
       const { data: upsertData, error: upsertErr } = await db.upsertThought(
         artifact.content,
         { metadata: { ...artifact.metadata, artifact_path: path } },
       );
-
       if (upsertErr || !upsertData) {
-        console.error(`[autosync] upsert failed for ${path}:`, upsertErr?.message);
+        console.error(`[autosync] (${repo}) upsert failed for ${path}:`, upsertErr?.message);
         continue;
       }
-
       const { data: alreadyEmbedded } = await db.hasEmbedding(upsertData.id);
-      if (alreadyEmbedded) {
-        console.log(`[autosync] skip embed (already present): ${artifact.content.slice(0, 60)}`);
-        continue;
-      }
-
+      if (alreadyEmbedded) continue;
       const embedding = await getEmbedding(artifact.content);
       await db.updateEmbedding(upsertData.id, embedding);
-      console.log(`[autosync] embedded: ${artifact.content.slice(0, 60)}`);
+      console.log(`[autosync] (${repo}) embedded: ${artifact.content.slice(0, 60)}`);
     } catch (err) {
-      console.error(`[autosync] error on ${path}:`, (err as Error).message);
+      console.error(`[autosync] (${repo}) error on ${path}:`, (err as Error).message);
     }
   }
 
-  // Advance cursor to now — next run fetches only artifacts created after this point.
-  _syncCursor = new Date().toISOString();
-  console.log(`[autosync] cursor → ${_syncCursor.slice(0, 19)}`);
+  if (maxCreated !== cursor) {
+    const { error: saveErr } = await db.setSyncCursor(maxCreated, cursorKey);
+    if (saveErr) console.error(`[autosync] (${repo}) cursor persist failed:`, saveErr.message);
+    else console.log(`[autosync] (${repo}) cursor → ${maxCreated.slice(0, 19)}`);
+  }
+}
+
+async function runAutoSync(): Promise<void> {
+  await loadScope();
+  if (_syncRepos.size === 0) {
+    console.log("[autosync] no repos in scope yet — capture or search a repo to start caching");
+    return;
+  }
+  for (const repo of _syncRepos) {
+    try {
+      await syncRepo(repo);
+    } catch (err) {
+      console.error(`[autosync] (${repo}) sync failed:`, (err as Error).message);
+    }
+  }
 }
 
 // Fire immediately on startup, then on the configured interval.
@@ -496,5 +540,8 @@ setInterval(
   AUTOSYNC_INTERVAL_MS,
 );
 console.log(`[autosync] started — interval ${AUTOSYNC_INTERVAL_MS / 1000}s`);
+probeRtRoot().catch((e) =>
+  console.error("[artifactory] probe failed:", (e as Error).message)
+);
 
 Deno.serve(app.fetch);

@@ -1,0 +1,20 @@
+{
+  "name": "Open Brain Up",
+  "description": "Install and start the dockerized Open Brain memory stack (Artifactory-as-SOT) against a team's own Artifactory. Handles jf auth, one-line env generation, corp-proxy CA build, startup, and health verification.",
+  "category": "skills",
+  "author": {
+    "name": "context-as-artifacts",
+    "github": "yuvalk"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["docker", "artifactory"],
+    "tools": ["docker compose v2", "jf CLI", "openssl"]
+  },
+  "tags": ["skill", "install", "startup", "docker", "artifactory", "ops", "open-brain"],
+  "difficulty": "intermediate",
+  "estimated_time": "15 minutes",
+  "created": "2026-06-17",
+  "updated": "2026-06-17"
+}

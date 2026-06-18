@@ -66,6 +66,16 @@ export interface Db {
   updateEmbedding(id: string, embedding: number[]): Promise<DbResult<null>>;
 
   hasEmbedding(id: string): Promise<DbResult<boolean>>;
+
+  // Remove every local row whose metadata.artifact_path matches. Used to enforce
+  // RT tombstones — returns the number of rows deleted.
+  deleteByArtifactPath(artifactPath: string): Promise<DbResult<number>>;
+
+  // Persisted key/value state in sync_state. Used for the per-repo autosync
+  // cursors (key "cursor:<repo>") and the persisted repo scope (key "sync_repos").
+  // Survives restarts so a reboot does not re-scan/re-download every artifact.
+  getSyncCursor(key?: string): Promise<DbResult<string | null>>;
+  setSyncCursor(iso: string, key?: string): Promise<DbResult<null>>;
 }
 
 // ── Supabase driver ──────────────────────────────────────────────────────────
@@ -162,6 +172,30 @@ function makeSupabaseDb(): Db {
         .single();
       return { data: data ? data.embedding !== null : false, error };
     },
+
+    async deleteByArtifactPath(artifactPath) {
+      const { error, count } = await sb()
+        .from("thoughts")
+        .delete({ count: "exact" })
+        .eq("metadata->>artifact_path", artifactPath);
+      return { data: count ?? 0, error };
+    },
+
+    async getSyncCursor(key = "autosync_cursor") {
+      const { data, error } = await sb()
+        .from("sync_state")
+        .select("value")
+        .eq("key", key)
+        .maybeSingle();
+      return { data: (data?.value as string) ?? null, error };
+    },
+
+    async setSyncCursor(iso, key = "autosync_cursor") {
+      const { error } = await sb()
+        .from("sync_state")
+        .upsert({ key, value: iso });
+      return { data: null, error };
+    },
   };
 }
 
@@ -174,9 +208,10 @@ function makePostgresDb(): Db {
       port: parseInt(Deno.env.get("DB_PORT") || "5432", 10),
       database: Deno.env.get("DB_NAME") || "openbrain",
       user: Deno.env.get("DB_USER") || "postgres",
-      // DB_PASSWORD is the app-specific name; fall back to POSTGRES_PASSWORD so a
-      // single secret can drive both the Postgres image and this client.
-      password: Deno.env.get("DB_PASSWORD") || Deno.env.get("POSTGRES_PASSWORD")!,
+      // The Postgres container runs with trust auth (loopback-only cache, port not
+      // published), so no password is required. We still pass one if provided, to
+      // support deployments that enable password auth.
+      password: Deno.env.get("DB_PASSWORD") || Deno.env.get("POSTGRES_PASSWORD") || "",
     },
     10,
   );
@@ -327,6 +362,62 @@ function makePostgresDb(): Db {
           [id],
         );
         return { data: result.rows[0]?.has_embedding ?? false, error: null };
+      } catch (e) {
+        return { data: null, error: { message: (e as Error).message } };
+      } finally {
+        client.release();
+      }
+    },
+
+    async deleteByArtifactPath(artifactPath) {
+      const client = await pool.connect();
+      try {
+        const result = await client.queryObject(
+          `DELETE FROM thoughts WHERE metadata->>'artifact_path' = $1`,
+          [artifactPath],
+        );
+        return { data: result.rowCount ?? 0, error: null };
+      } catch (e) {
+        return { data: null, error: { message: (e as Error).message } };
+      } finally {
+        client.release();
+      }
+    },
+
+    async getSyncCursor(key = "autosync_cursor") {
+      const client = await pool.connect();
+      try {
+        // Lazily ensure the table exists so existing deploys upgrade without a
+        // DB reset (the server connects as postgres, so DDL is permitted).
+        await client.queryObject(
+          `CREATE TABLE IF NOT EXISTS sync_state (
+             key text PRIMARY KEY,
+             value text NOT NULL,
+             updated_at timestamptz DEFAULT now()
+           )`,
+        );
+        const result = await client.queryObject<{ value: string }>(
+          `SELECT value FROM sync_state WHERE key = $1 LIMIT 1`,
+          [key],
+        );
+        return { data: result.rows[0]?.value ?? null, error: null };
+      } catch (e) {
+        return { data: null, error: { message: (e as Error).message } };
+      } finally {
+        client.release();
+      }
+    },
+
+    async setSyncCursor(iso, key = "autosync_cursor") {
+      const client = await pool.connect();
+      try {
+        await client.queryObject(
+          `INSERT INTO sync_state (key, value, updated_at)
+           VALUES ($1, $2, now())
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+          [key, iso],
+        );
+        return { data: null, error: null };
       } catch (e) {
         return { data: null, error: { message: (e as Error).message } };
       } finally {

@@ -1,27 +1,28 @@
 # docker/docker-compose.yml
-# Open Brain — docker-compose stack (no Supabase, Ollama-only)
+# Open Brain — self-contained stack (pgvector + TEI embeddings + MCP server).
 #
-# Prerequisites:
-#   cp .env.example .env
-#   cp .env.secrets.example .env.secrets
-#   # Edit .env.secrets: set MCP_ACCESS_KEY and POSTGRES_PASSWORD
+# Zero hand-editing. All static plumbing is hardcoded below as literals. The only
+# real input is RT_REPO (your memories repo in Artifactory); everything else has a
+# working default. The installer writes a small generated .env with RT_REPO + an auto
+# password + arch/offline image pins — you never edit a config file by hand.
 #
-# Start:
-#   docker compose up -d
-#
-# First run pulls ~4 GB of Ollama models; the server waits until the pull completes.
+# Source build (no bundle):   RT_REPO=my-memories docker compose up -d --build
+# Auth comes from the jf config mounted at ./jfrog-config (NOT from env).
+
+name: openbrain
 
 services:
   db:
-    image: pgvector/pgvector:pg16
-    env_file:
-      - .env
-      - .env.secrets
+    image: "${DB_IMAGE:-pgvector/pgvector:pg16}"
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_DB: "${POSTGRES_DB:-openbrain}"
+      POSTGRES_DB: openbrain
+      # No password: this is a loopback-only cache whose port is never published and
+      # is reachable only by the tei/server containers on the compose network. Trust
+      # auth removes the entire "password authentication failed" failure mode.
+      POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
-      - ./openbrain-data/data:/var/lib/postgresql/data
+      - openbrain-pg-data:/var/lib/postgresql/data
       - ./init/01-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -30,36 +31,38 @@ services:
       retries: 10
     restart: unless-stopped
 
-  ollama:
-    image: ollama/ollama
+  # Embedding backend: HuggingFace Text Embeddings Inference (CPU, Rust).
+  # Serves an OpenAI-compatible /v1/embeddings. arm64 hosts: installer pins the
+  # cpu-arm64 tag in the generated .env.
+  tei:
+    image: "${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}"
+    command:
+      - "--model-id"
+      - "${EMBED_MODEL:-mixedbread-ai/mxbai-embed-large-v1}"
+      - "--port"
+      - "8080"
+      - "--auto-truncate"
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+      # Xet CDN (us.aws.cdn.hf.co) is often blocked by corporate TLS proxies;
+      # disabling it routes weight downloads through huggingface.co directly.
+      HF_HUB_DISABLE_XET: "1"
     volumes:
-      - ./openbrain-data/ollama:/root/.ollama
+      - openbrain-tei-data:/data
+      # Offline/air-gapped: the bundle ships weights in ./tei-model and the installer
+      # sets EMBED_MODEL=/model. On open networks this mount is unused.
+      - "${TEI_MODEL_DIR:-./tei-model}:/model:ro"
     healthcheck:
-      test: ["CMD", "ollama", "list"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 10s
-      timeout: 10s
-      retries: 12
-      start_period: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
     restart: unless-stopped
 
-  ollama-pull:
-    image: ollama/ollama
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      OLLAMA_HOST: "http://ollama:11434"
-      EMBED_MODEL: "${EMBED_MODEL:-mxbai-embed-large}"
-      CHAT_MODEL: "${CHAT_MODEL:-gemma3:4b}"
-    entrypoint:
-      - sh
-      - -c
-      - "ollama pull $${EMBED_MODEL} && ollama pull $${CHAT_MODEL}"
-    volumes:
-      - ./openbrain-data/ollama:/root/.ollama
-    restart: "no"
-
   server:
+    # Build from source (leave OPENBRAIN_IMAGE unset) or run a prebuilt/loaded image.
+    image: "${OPENBRAIN_IMAGE:-openbrain-mcp-server:local}"
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -68,19 +71,50 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      ollama-pull:
-        condition: service_completed_successfully
+      tei:
+        condition: service_healthy
+    # Loopback only: the MCP endpoint is a private, per-developer detail. Sharing
+    # happens via Artifactory (the SOT), not this port.
     ports:
-      - "${PORT:-8000}:8000"
-    env_file:
-      - .env
-      - .env.secrets
+      - "127.0.0.1:${PORT:-8787}:8000"
+    environment:
+      # ── static plumbing (never user-edited) ───────────────────────────────────
+      DB_DRIVER: postgres
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: openbrain
+      DB_USER: postgres
+      LLM_BASE: http://tei:8080/v1
+      LLM_API_KEY: tei
+      EMBED_MODEL: "${EMBED_MODEL:-mixedbread-ai/mxbai-embed-large-v1}"
+      JF_PATH: /usr/local/bin/jf
+      # ── the one real input + jf/provenance derivables ─────────────────────────
+      RT_REPO: "${RT_REPO:-open-brain-memories}"
+      JF_SERVER_ID: "${JF_SERVER_ID:-intro}"
+      GIT_USER: "${GIT_USER:-unknown}"
+      # Optional: pre-seed which repos this client caches (comma-separated). The
+      # scope also grows automatically as repos are captured-to / searched.
+      SYNC_REPOS: "${SYNC_REPOS:-}"
+      # Optional: autosync poll interval in ms (default 300000 = 5 min).
+      AUTOSYNC_INTERVAL_MS: "${AUTOSYNC_INTERVAL_MS:-300000}"
+    volumes:
+      # jf auth: the server shells out to `jf` using this mounted config.
+      - ./jfrog-config:/home/deno/.jfrog:ro
+    healthcheck:
+      # `deno eval` runs with implicit permissions, so no --allow-net flag.
+      test: ["CMD", "deno", "eval", "const r=await fetch('http://localhost:8000/health').catch(()=>null);Deno.exit(r&&r.ok?0:1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
-# Build-time CA for the server image. Behind a corporate TLS proxy, set
-# CA_CERT_FILE to your CA path before building:
+# Build-time CA for the server image (source build behind a TLS proxy):
 #   CA_CERT_FILE=./corp-ca.pem docker compose up -d --build
-# Defaults to /dev/null (empty) → the build secret is a no-op on clean networks.
+volumes:
+  openbrain-pg-data:
+  openbrain-tei-data:
+
 secrets:
   ca:
     file: ${CA_CERT_FILE:-/dev/null}
