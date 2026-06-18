@@ -279,13 +279,29 @@ location everyone pulls from. Memories live in one shared RT repo (`RT_REPO`) bu
 **foldered per git repo**: `RT_REPO/<repo>/thoughts/<sha>.json`. `repo` is
 required on every capture, so each project's memories are physically separated and
 search is scoped to the caller's repo. A teammate in *any* project bootstraps with no
-checkout:
+checkout.
+
+The installer does **not assume** which Artifactory you're on. Specify the
+connection explicitly (precedence top→bottom):
+
+| How | Env vars | When |
+|---|---|---|
+| Register on the fly | `JF_URL` + `JF_ACCESS_TOKEN` (+ optional `JF_SERVER_ID`, default `openbrain`) | friend has no `jf` setup, or default points elsewhere |
+| Use a configured server | `JF_SERVER_ID` | friend already has that server in `jf config` |
+| Default server | _(none)_ | friend's default `jf` already points at the right RT |
+
+Example — repo21 (entplus), no prior `jf` setup, team repo doubles as the
+memories repo:
 
 ```bash
-jf rt download generic-local/openbrain/install_from_bundle.sh . --flat=true
+jf rt download openbrain-team-3/dist/install_from_bundle.sh . --flat=true
 chmod +x install_from_bundle.sh
-./install_from_bundle.sh generic-local/openbrain/openbrain-bundle-offline-arm64.tar.gz open-brain-memories
+JF_URL=https://entplus.jfrog.io JF_ACCESS_TOKEN=<token> \
+  ./install_from_bundle.sh openbrain-team-3/dist/openbrain-bundle-offline-arm64.tar.gz openbrain-team-3
 ```
+
+(Drop the `JF_URL/JF_ACCESS_TOKEN` prefix if their default `jf` already points at
+the right Artifactory; or use `JF_SERVER_ID=<id>` to pick a configured server.)
 
 `install_from_bundle.sh` auto-detects the offline layout (an `images/` dir +
 `IMAGE_TAG.txt` with `OFFLINE=1`): it loads every image, pins the exact `TEI_IMAGE`

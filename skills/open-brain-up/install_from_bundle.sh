@@ -1,33 +1,61 @@
 #!/usr/bin/env bash
 # install_from_bundle.sh — bring up the Open Brain MCP server from a prebuilt bundle.
 #
-# Assumes your `jf` CLI is already configured and points at the SAME Artifactory
-# that holds the bundle and the shared memories (so no URL/token/server-id needed).
+# Points at the Artifactory that holds the bundle AND the shared memories. The
+# connection is NOT assumed: specify it explicitly, or fall back to your default.
 #
 # Usage:
 #   ./install_from_bundle.sh <BUNDLE_RT_PATH> <MEMORIES_REPO>
 #
 # Example:
-#   ./install_from_bundle.sh generic-local/openbrain/openbrain-bundle-arm64.tar.gz open-brain-memories
+#   ./install_from_bundle.sh openbrain-team-3/dist/openbrain-bundle-offline-arm64.tar.gz openbrain-team-3
 #
 # Param 1  BUNDLE_RT_PATH  Artifactory path to the bundle tarball.
 # Param 2  MEMORIES_REPO   Generic local repo for memories. Created if missing.
+#
+# Specify the Artifactory connection (pick ONE; precedence top→bottom):
+#   JF_URL + JF_ACCESS_TOKEN   register a server on the fly (no prior jf setup needed).
+#                              optional JF_SERVER_ID names it (default: openbrain).
+#   JF_SERVER_ID               use an already-configured `jf` server by id.
+#   (nothing)                  use your current default `jf` server.
+#
+# Examples:
+#   JF_URL=https://entplus.jfrog.io JF_ACCESS_TOKEN=*** \
+#     ./install_from_bundle.sh openbrain-team-3/dist/openbrain-bundle-offline-arm64.tar.gz openbrain-team-3
+#   JF_SERVER_ID=repo21 \
+#     ./install_from_bundle.sh openbrain-team-3/dist/openbrain-bundle-offline-arm64.tar.gz openbrain-team-3
 set -euo pipefail
 
 BUNDLE_RT_PATH="${1:-}"
 MEMORIES_REPO="${2:-}"
 if [[ -z "$BUNDLE_RT_PATH" || -z "$MEMORIES_REPO" ]]; then
-  echo "usage: $0 <BUNDLE_RT_PATH> <MEMORIES_REPO>" >&2
+  echo "usage: $0 <BUNDLE_RT_PATH> <MEMORIES_REPO>   (see header for JF_URL/JF_ACCESS_TOKEN/JF_SERVER_ID)" >&2
   exit 2
 fi
 
-command -v jf >/dev/null     || { echo "jf CLI not found — install + configure it first." >&2; exit 1; }
+command -v jf >/dev/null     || { echo "jf CLI not found — install it first (https://jfrog.com/getcli/)." >&2; exit 1; }
 command -v docker >/dev/null || { echo "docker not found." >&2; exit 1; }
 
-# Resolve the default jf server id (the connection we reuse for everything).
-JF_SERVER_ID="$(jf config show 2>/dev/null | awk '/^Server ID:/{id=$3} /^Default:[[:space:]]*true/{print id; exit}')"
-[[ -n "$JF_SERVER_ID" ]] || { echo "No default jf server. Run: jf config use <id>" >&2; exit 1; }
-echo "[install] using jf server: $JF_SERVER_ID"
+# Resolve the jf server to use — explicit beats default, never assumed.
+JF_SERVER_ID="${JF_SERVER_ID:-}"
+if [[ -n "${JF_URL:-}" && -n "${JF_ACCESS_TOKEN:-}" ]]; then
+  # 1. Register (idempotently) a server from URL + token.
+  JF_SERVER_ID="${JF_SERVER_ID:-openbrain}"
+  echo "[install] configuring jf server '${JF_SERVER_ID}' → ${JF_URL}"
+  jf config remove "$JF_SERVER_ID" --quiet 2>/dev/null || true
+  jf config add "$JF_SERVER_ID" \
+    --url="$JF_URL" --access-token="$JF_ACCESS_TOKEN" --interactive=false
+elif [[ -n "$JF_SERVER_ID" ]]; then
+  # 2. Use a server the friend already configured.
+  jf config show "$JF_SERVER_ID" >/dev/null 2>&1 \
+    || { echo "jf server '$JF_SERVER_ID' not found. Configure it or pass JF_URL+JF_ACCESS_TOKEN." >&2; exit 1; }
+  echo "[install] using specified jf server: $JF_SERVER_ID"
+else
+  # 3. Fall back to the current default server.
+  JF_SERVER_ID="$(jf config show 2>/dev/null | awk '/^Server ID:/{id=$3} /^Default:[[:space:]]*true/{print id; exit}')"
+  [[ -n "$JF_SERVER_ID" ]] || { echo "No jf connection. Set JF_URL+JF_ACCESS_TOKEN, or JF_SERVER_ID, or run: jf config use <id>" >&2; exit 1; }
+  echo "[install] using default jf server: $JF_SERVER_ID"
+fi
 
 # 1. Ensure the memories repo exists (create a generic local repo if missing).
 code="$(jf rt curl -s -o /dev/null -w '%{http_code}' -XGET "/api/repositories/${MEMORIES_REPO}" --server-id "$JF_SERVER_ID" || true)"
