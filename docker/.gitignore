@@ -3,3 +3,4 @@ openbrain-data/
 .env.secrets
 tei-model/
 *.pem
+dist/

@@ -207,9 +207,10 @@ function makePostgresDb(): Db {
       port: parseInt(Deno.env.get("DB_PORT") || "5432", 10),
       database: Deno.env.get("DB_NAME") || "openbrain",
       user: Deno.env.get("DB_USER") || "postgres",
-      // DB_PASSWORD is the app-specific name; fall back to POSTGRES_PASSWORD so a
-      // single secret can drive both the Postgres image and this client.
-      password: Deno.env.get("DB_PASSWORD") || Deno.env.get("POSTGRES_PASSWORD")!,
+      // The Postgres container runs with trust auth (loopback-only cache, port not
+      // published), so no password is required. We still pass one if provided, to
+      // support deployments that enable password auth.
+      password: Deno.env.get("DB_PASSWORD") || Deno.env.get("POSTGRES_PASSWORD") || "",
     },
     10,
   );

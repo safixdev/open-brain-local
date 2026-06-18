@@ -18,7 +18,25 @@ not a local chat model.
 
 Stack = 3 containers: `db` (pgvector), `tei` (embeddings), `server` (MCP).
 
-## Inputs the team MUST provide
+## Fastest path — install from a prebuilt bundle (2 args)
+
+If your `jf` CLI is already configured for the **same** Artifactory that holds the
+bundle and the shared memories, use the bundled script — it needs only two
+arguments and derives everything else (server, token, git user) from your jf
+config and git:
+
+```bash
+./install_from_bundle.sh <BUNDLE_RT_PATH> <MEMORIES_REPO>
+# e.g.
+./install_from_bundle.sh generic-local/openbrain/openbrain-bundle-arm64.tar.gz open-brain-memories
+```
+
+It will: create `<MEMORIES_REPO>` (generic local) if missing → download + load the
+image → generate the one-line `.env` (only `RT_REPO` + derived) → reuse your jf credentials for the container →
+pre-fetch the embedding model if the CDN is blocked → `docker compose up -d
+--no-build` → wait for health. Skip the manual steps below in this case.
+
+## Inputs the team MUST provide (manual path)
 
 Ask for these before doing anything (do not guess):
 
@@ -62,25 +80,30 @@ JFROG_CLI_HOME_DIR="$PWD/jfrog-config" jf config add "$JF_SERVER_ID" \
   --url="$ARTIFACTORY_URL" --access-token="$ACCESS_TOKEN" --interactive=false
 JFROG_CLI_HOME_DIR="$PWD/jfrog-config" jf config use "$JF_SERVER_ID"
 # sanity: list the (empty) repo
-JFROG_CLI_HOME_DIR="$PWD/jfrog-config" jf rt search "$RT_REPO/thoughts/*.json" --server-id "$JF_SERVER_ID"
+JFROG_CLI_HOME_DIR="$PWD/jfrog-config" jf rt search "$RT_REPO/*/thoughts/*.json" --server-id "$JF_SERVER_ID"
 ```
 
-## 2. Config files
+## 2. Config (one value — no `.env` templates, no `.env.secrets`)
+
+The stack is self-contained: `docker-compose.yml` hardcodes every plumbing var
+(`DB_*`, `LLM_*`, `EMBED_MODEL`, `DB_DRIVER`, …). The **only** real input is your
+memories repo. Drop a one-line `.env` (compose auto-loads it for interpolation):
 
 ```bash
-cp .env.example .env
-cp .env.secrets.example .env.secrets
-# secret:
-openssl rand -hex 32   # -> POSTGRES_PASSWORD in .env.secrets
+echo "RT_REPO=$RT_REPO" > .env
+# only if your default jf server isn't 'intro':
+echo "JF_SERVER_ID=$JF_SERVER_ID" >> .env
 ```
 
 > The MCP endpoint has no auth and is bound to `127.0.0.1` only — it's a private
 > per-developer service. Shared-memory access control lives in Artifactory (RT
 > repo permissions + the access token), not on this port.
 
-Edit `.env` and set `JF_SERVER_ID`, `RT_REPO`, `GIT_USER`, and `PORT` (default
-`8787`) to match the inputs above. `.env` / `.env.secrets` / `jfrog-config/` are
-git-ignored — never commit them.
+There is **no `.env.secrets`** and **no Postgres password**: the loopback-only DB
+runs with trust auth (its port is never published; only the tei/server containers can
+reach it). Optional overrides you may add to `.env`: `PORT` (default `8787`),
+`GIT_USER` (provenance fallback), `OPENBRAIN_IMAGE` (prebuilt server ref), `TEI_IMAGE`
+(arm64 tag). `.env` and `jfrog-config/` are git-ignored — never commit them.
 
 ## 3. Corporate proxy (only if behind one)
 
@@ -164,12 +187,12 @@ curl -s "$BASE/health"   # -> {"status":"ok"}
 # capture (agent supplies metadata; endpoint has no auth, localhost-only)
 curl -s -X POST "$BASE/" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture_thought","arguments":{"content":"open-brain-up smoke test","type":"observation","topics":["smoke-test"],"source":"user"}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture_memory","arguments":{"content":"open-brain-up smoke test","type":"observation","topics":["smoke-test"],"source":"user"}}}'
 
 # search it back
 curl -s -X POST "$BASE/" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_thoughts","arguments":{"query":"smoke test"}}}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_memories","arguments":{"query":"smoke test"}}}'
 ```
 
 Expect `Captured as observation — smoke-test` then the thought returned by search.
@@ -179,14 +202,14 @@ Inspect what's in Artifactory at any time with the bundled helper:
 RT_SERVER_ID=$JF_SERVER_ID RT_REPO=$RT_REPO bash skills/open-brain-up/list_rt_memories.sh
 ```
 
-Clean up the smoke-test memory with the `delete_thought` tool (it tombstones for
+Clean up the smoke-test memory with the `delete_memory` tool (it tombstones for
 an audit trail).
 
 ## 6. Wire up an MCP client
 
 Point the client at `http://localhost:<PORT>/` (no auth header needed — the
-endpoint is loopback-only). Four tools appear: `capture_thought`,
-`search_thoughts`, `list_thoughts`, `delete_thought`.
+endpoint is loopback-only). Four tools appear: `capture_memory`,
+`search_memories`, `list_memories`, `delete_memory`.
 
 ## Troubleshooting
 
@@ -232,3 +255,40 @@ Only the `server` image ships this way. `db` (pgvector/pgvector:pg16) and `tei`
 (text-embeddings-inference) are public images compose pulls directly (or via your
 mirror). Tag releases with a real version (`vN`), not `latest`, so deployments are
 reproducible.
+
+## Publishing (maintainer — offline bundle, for proxy/air-gapped teams)
+
+When teammates are behind a TLS proxy that blocks the HF CDN (or are fully
+air-gapped), ship a **fully offline bundle** instead: it `docker save`s all three
+images and includes the embedding model weights, so the target host needs zero
+registry/CDN egress at `up`.
+
+```bash
+cd docker
+# prefetch the model once (host has the CA/proxy) into ./tei-model, then:
+./build_bundle.sh                 # → dist/openbrain-bundle-offline-<arch>.tar.gz (~945 MB arm64)
+jf rt upload dist/openbrain-bundle-offline-arm64.tar.gz \
+  generic-local/openbrain/openbrain-bundle-offline-arm64.tar.gz --flat=true
+# Ship the installer to the SAME global path so consumers don't need this repo cloned:
+jf rt upload ../skills/open-brain-up/install_from_bundle.sh \
+  generic-local/openbrain/install_from_bundle.sh --flat=true
+```
+
+These RT paths (bundle + installer) are **global, not per-git-repo** — one shared
+location everyone pulls from. Memories live in one shared RT repo (`RT_REPO`) but are
+**foldered per git repo**: `RT_REPO/<repo>/thoughts/<sha>.json`. `repo` is
+required on every capture, so each project's memories are physically separated and
+search is scoped to the caller's repo. A teammate in *any* project bootstraps with no
+checkout:
+
+```bash
+jf rt download generic-local/openbrain/install_from_bundle.sh . --flat=true
+chmod +x install_from_bundle.sh
+./install_from_bundle.sh generic-local/openbrain/openbrain-bundle-offline-arm64.tar.gz open-brain-memories
+```
+
+`install_from_bundle.sh` auto-detects the offline layout (an `images/` dir +
+`IMAGE_TAG.txt` with `OFFLINE=1`): it loads every image, pins the exact `TEI_IMAGE`
+/`OPENBRAIN_IMAGE`/`db` refs the bundle shipped, mounts the bundled model
+(`EMBED_MODEL=/model`), and skips the CDN prefetch entirely. Build one bundle per
+arch (`arm64`, `amd64`) — `docker save` is single-arch.

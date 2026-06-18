@@ -10,20 +10,20 @@ team's **own Artifactory**:
 
 1. Collect the team's Artifactory inputs (URL, access token, server-id, repo).
 2. Generate the `jf` CLI config the server mounts (`docker/jfrog-config/`).
-3. Template `.env` / `.env.secrets` and generate strong secrets.
+3. Generate a one-line `.env` (only `RT_REPO`; no `.env.secrets`).
 4. Build (with corporate-CA support for TLS-intercepting proxies) and start.
 5. Verify with a capture → search round trip.
 
 ## Architecture recap
 
 - **Artifactory = source of truth.** Every memory is an artifact at
-  `<RT_REPO>/thoughts/<sha256>.json` with provenance properties (`git_user`,
-  `repo`, `created_at`, `content`, `type`, `topics`, …).
+  `<RT_REPO>/<repo>/thoughts/<sha256>.json` (foldered per git repo) with
+  provenance properties (`git_user`, `repo`, `created_at`, `content`, `type`, `topics`, …).
 - **pgvector = rebuildable index**, synced from Artifactory. `down -v` is safe;
   a re-sync rebuilds it.
 - **Deletes are tombstones** (`<id>.deleted.json`) — an audit trail; sync removes
   tombstoned memories from pgvector.
-- **No chat model.** The calling agent supplies metadata to `capture_thought`.
+- **No chat model.** The calling agent supplies metadata to `capture_memory`.
 
 ## Files
 

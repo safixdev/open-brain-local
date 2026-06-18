@@ -1,27 +1,26 @@
 # docker/docker-compose.yml
-# Open Brain — docker-compose stack (pgvector + TEI embeddings + MCP server)
+# Open Brain — self-contained stack (pgvector + TEI embeddings + MCP server).
 #
-# Prerequisites:
-#   cp .env.example .env
-#   cp .env.secrets.example .env.secrets
-#   # Edit .env.secrets: set MCP_ACCESS_KEY and POSTGRES_PASSWORD
+# Zero hand-editing. All static plumbing is hardcoded below as literals. The only
+# real input is RT_REPO (your memories repo in Artifactory); everything else has a
+# working default. The installer writes a small generated .env with RT_REPO + an auto
+# password + arch/offline image pins — you never edit a config file by hand.
 #
-# Start:
-#   docker compose up -d
-#
-# On first run TEI loads the embedding model (~0.67 GB); the server waits until
-# tei is healthy. Behind a proxy that blocks HF's CDN, pre-fetch the model into
-# ./tei-model and set EMBED_MODEL=/model (see the open-brain-up skill).
+# Source build (no bundle):   RT_REPO=my-memories docker compose up -d --build
+# Auth comes from the jf config mounted at ./jfrog-config (NOT from env).
+
+name: openbrain
 
 services:
   db:
-    image: pgvector/pgvector:pg16
-    env_file:
-      - .env
-      - .env.secrets
+    image: "${DB_IMAGE:-pgvector/pgvector:pg16}"
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_DB: "${POSTGRES_DB:-openbrain}"
+      POSTGRES_DB: openbrain
+      # No password: this is a loopback-only cache whose port is never published and
+      # is reachable only by the tei/server containers on the compose network. Trust
+      # auth removes the entire "password authentication failed" failure mode.
+      POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - openbrain-pg-data:/var/lib/postgresql/data
       - ./init/01-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -33,8 +32,8 @@ services:
     restart: unless-stopped
 
   # Embedding backend: HuggingFace Text Embeddings Inference (CPU, Rust).
-  # ~343 MB image vs Ollama's ~4 GB. Serves an OpenAI-compatible /v1/embeddings.
-  # Apple Silicon / arm64 hosts: set TEI_IMAGE to the cpu-arm64 tag in .env.
+  # Serves an OpenAI-compatible /v1/embeddings. arm64 hosts: installer pins the
+  # cpu-arm64 tag in the generated .env.
   tei:
     image: "${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}"
     command:
@@ -50,9 +49,8 @@ services:
       HF_HUB_DISABLE_XET: "1"
     volumes:
       - openbrain-tei-data:/data
-      # Air-gapped / corp-proxy networks that block HF's CDN: pre-fetch the model
-      # on the host into ${TEI_MODEL_DIR} and set EMBED_MODEL=/model (see README).
-      # On open networks leave EMBED_MODEL as the HF id and this mount is unused.
+      # Offline/air-gapped: the bundle ships weights in ./tei-model and the installer
+      # sets EMBED_MODEL=/model. On open networks this mount is unused.
       - "${TEI_MODEL_DIR:-./tei-model}:/model:ro"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
@@ -63,12 +61,7 @@ services:
     restart: unless-stopped
 
   server:
-    # Distribution:
-    #   • Build from source (option A): leave OPENBRAIN_IMAGE unset, run
-    #     `docker compose build server` — the image is tagged `openbrain-mcp-server:local`.
-    #   • Prebuilt from a registry (option B): set OPENBRAIN_IMAGE to the pushed
-    #     ref (e.g. acme.jfrog.io/openbrain-docker/openbrain-mcp-server:v1.0.0),
-    #     then `docker compose pull server && docker compose up -d --no-build`.
+    # Build from source (leave OPENBRAIN_IMAGE unset) or run a prebuilt/loaded image.
     image: "${OPENBRAIN_IMAGE:-openbrain-mcp-server:local}"
     build:
       context: ..
@@ -80,17 +73,27 @@ services:
         condition: service_healthy
       tei:
         condition: service_healthy
-    # Bound to loopback only: the MCP endpoint is a private, per-developer detail.
-    # Sharing happens via Artifactory (the SOT), not this port. To expose it on a
-    # network you MUST add auth + TLS at an ingress first.
+    # Loopback only: the MCP endpoint is a private, per-developer detail. Sharing
+    # happens via Artifactory (the SOT), not this port.
     ports:
       - "127.0.0.1:${PORT:-8787}:8000"
-    env_file:
-      - .env
-      - .env.secrets
     environment:
+      # ── static plumbing (never user-edited) ───────────────────────────────────
+      DB_DRIVER: postgres
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: openbrain
+      DB_USER: postgres
+      LLM_BASE: http://tei:8080/v1
+      LLM_API_KEY: tei
+      EMBED_MODEL: "${EMBED_MODEL:-mixedbread-ai/mxbai-embed-large-v1}"
       JF_PATH: /usr/local/bin/jf
+      # ── the one real input + jf/provenance derivables ─────────────────────────
+      RT_REPO: "${RT_REPO:-open-brain-memories}"
+      JF_SERVER_ID: "${JF_SERVER_ID:-intro}"
+      GIT_USER: "${GIT_USER:-unknown}"
     volumes:
+      # jf auth: the server shells out to `jf` using this mounted config.
       - ./jfrog-config:/home/deno/.jfrog:ro
     healthcheck:
       # `deno eval` runs with implicit permissions, so no --allow-net flag.
@@ -101,10 +104,8 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-# Build-time CA for the server image. Behind a corporate TLS proxy, set
-# CA_CERT_FILE to your CA path before building:
+# Build-time CA for the server image (source build behind a TLS proxy):
 #   CA_CERT_FILE=./corp-ca.pem docker compose up -d --build
-# Defaults to /dev/null (empty) → the build secret is a no-op on clean networks.
 volumes:
   openbrain-pg-data:
   openbrain-tei-data:

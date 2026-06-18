@@ -16,14 +16,15 @@ aql() {
 }
 
 # ── Live memories ────────────────────────────────────────────────────────────
+# Memories are foldered per git repo: <repo>/thoughts/<sha>.json
 LIVE=$(aql "items.find({
   \"repo\":\"$REPO\",
-  \"path\":\"thoughts\",
+  \"path\":{\"\$match\":\"*/thoughts\"},
   \"\$and\":[
     {\"name\":{\"\$match\":\"*.json\"}},
     {\"name\":{\"\$nmatch\":\"*.deleted.json\"}}
   ]
-}).include(\"name\",\"created\",\"property\").sort({\"\$asc\":[\"created\"]})")
+}).include(\"name\",\"path\",\"created\",\"property\").sort({\"\$asc\":[\"created\"]})")
 
 LIVE_COUNT=$(echo "$LIVE" | jq '.results | length')
 
@@ -63,9 +64,9 @@ fi
 # ── Tombstones (deleted memories — trace) ────────────────────────────────────
 TOMB=$(aql "items.find({
   \"repo\":\"$REPO\",
-  \"path\":\"thoughts\",
+  \"path\":{\"\$match\":\"*/thoughts\"},
   \"name\":{\"\$match\":\"*.deleted.json\"}
-}).include(\"name\",\"created\",\"property\").sort({\"\$asc\":[\"created\"]})")
+}).include(\"name\",\"path\",\"created\",\"property\").sort({\"\$asc\":[\"created\"]})")
 
 TOMB_COUNT=$(echo "$TOMB" | jq '.results | length')
 

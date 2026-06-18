@@ -8,14 +8,29 @@
 //   JF_SERVER_ID  — jf server ID to use (default: "intro")
 //   RT_REPO       — generic local repo name (default: "open-brain-memories")
 //
-// Artifact path convention inside the repo:
-//   thoughts/<sha256-of-content>.json
+// Artifact path convention inside the repo — memories are foldered per git repo for
+// a clear separation when browsing RT:
+//   <repo>/thoughts/<sha256-of-content>.json
+//   <repo>/thoughts/<sha256-of-content>.deleted.json   (tombstone)
 //
 // Artifact payload (JSON) — embedding excluded, re-generated on sync:
 //   { id, content, metadata, created_at }
 
 const JF_SERVER_ID = Deno.env.get("JF_SERVER_ID") ?? "intro";
 const RT_REPO = Deno.env.get("RT_REPO") ?? "open-brain-memories";
+
+// Folder (within RT_REPO) that holds a given git repo's memories. Sanitised so an
+// arbitrary repo name is a safe single path segment.
+export function repoFolder(repo: string): string {
+  const safe = repo.trim().replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!safe) throw new Error("repo is required to locate memories");
+  return safe;
+}
+
+// Live artifact sub-path for a memory in a given repo.
+export function liveSubPath(repo: string, id: string): string {
+  return `${repoFolder(repo)}/thoughts/${id}.json`;
+}
 
 export type ThoughtArtifact = {
   id: string;
@@ -99,11 +114,11 @@ export async function probeRtRoot(): Promise<void> {
   }
   console.log(`[artifactory] server-id : ${JF_SERVER_ID}`);
   console.log(`[artifactory] base url  : ${baseUrl}`);
-  console.log(`[artifactory] repo root : ${baseUrl}/${RT_REPO}/thoughts/`);
+  console.log(`[artifactory] repo root : ${baseUrl}/${RT_REPO}/<repo>/thoughts/`);
 }
 
 // Push a thought artifact to Artifactory via `jf rt upload`.
-// Returns the artifact sub-path within the repo (e.g. "thoughts/<sha256>.json").
+// Returns the artifact sub-path within the repo (e.g. "<repo>/thoughts/<sha256>.json").
 // Idempotent: same content → same SHA-256 → same path.
 //
 // RT properties written on each artifact (enables AQL listing without downloads):
@@ -118,18 +133,20 @@ export async function probeRtRoot(): Promise<void> {
 //   created_at — ISO timestamp of capture (queryable; mirrors RT's own created field)
 //   tombstone  — always "false" on creation
 export async function pushArtifact(thought: ThoughtArtifact): Promise<string> {
+  const m = thought.metadata as Record<string, unknown>;
+  const repo = m.repo ? String(m.repo) : "";
+  if (!repo) throw new Error("repo is required to capture a memory");
+
   const hash = await sha256Hex(thought.content);
-  const subPath = `thoughts/${hash}.json`;
+  const subPath = liveSubPath(repo, hash);
   const remotePath = `${RT_REPO}/${subPath}`;
 
-  const m = thought.metadata as Record<string, unknown>;
   const topics = Array.isArray(m.topics)
     ? (m.topics as string[]).slice(0, 5).join(",")
     : "";
   const gitUser = String(
     m.git_user ?? m.user_id ?? Deno.env.get("GIT_USER") ?? Deno.env.get("USER") ?? "unknown",
   );
-  const repo = m.repo ? String(m.repo) : "";
   const context = m.context ? String(m.context) : "";
   const propsStr = [
     `content=${encodeURIComponent(thought.content.slice(0, 200))}`,
@@ -163,7 +180,7 @@ export async function pushArtifact(thought: ThoughtArtifact): Promise<string> {
 export async function listArtifacts(): Promise<{ path: string; created: string }[]> {
   const { code, stdout, stderr } = await runJf([
     "rt", "search",
-    `${RT_REPO}/thoughts/*.json`,
+    `${RT_REPO}/*/thoughts/*.json`,
   ]);
   if (code !== 0) throw new Error(`jf rt search failed: ${stderr}`);
   if (!stdout || stdout === "[]") return [];
@@ -185,7 +202,7 @@ export type Tombstone = { id: string; path: string; created: string };
 export async function listTombstones(): Promise<Tombstone[]> {
   const { code, stdout, stderr } = await runJf([
     "rt", "search",
-    `${RT_REPO}/thoughts/*.deleted.json`,
+    `${RT_REPO}/*/thoughts/*.deleted.json`,
   ]);
   if (code !== 0) throw new Error(`jf rt search (tombstones) failed: ${stderr}`);
   if (!stdout || stdout === "[]") return [];
@@ -206,9 +223,10 @@ export async function listTombstones(): Promise<Tombstone[]> {
 // tombstones by removing the matching memory from pgvector.
 export async function pushTombstone(
   id: string,
+  repo: string,
   trace: { git_user?: string; content?: string } = {},
 ): Promise<string> {
-  const subPath = `thoughts/${id}.deleted.json`;
+  const subPath = `${repoFolder(repo)}/thoughts/${id}.deleted.json`;
   const remotePath = `${RT_REPO}/${subPath}`;
   const deletedAt = new Date().toISOString();
   const deletedBy = trace.git_user ?? Deno.env.get("GIT_USER") ?? Deno.env.get("USER") ?? "unknown";
@@ -244,16 +262,16 @@ export async function pushTombstone(
 }
 
 // Delete the live artifact for a memory (the "<id>.json" file). Best-effort.
-export async function deleteArtifact(id: string): Promise<void> {
-  const remotePath = `${RT_REPO}/thoughts/${id}.json`;
+export async function deleteArtifact(id: string, repo: string): Promise<void> {
+  const remotePath = `${RT_REPO}/${liveSubPath(repo, id)}`;
   const { code, stderr } = await runJf(["rt", "delete", remotePath, "--quiet"]);
   if (code !== 0) throw new Error(`jf rt delete failed: ${stderr}`);
 }
 
 // Remove a tombstone, e.g. to resurrect a memory that is being re-captured.
 // Best-effort: a missing tombstone is not an error.
-export async function removeTombstone(id: string): Promise<void> {
-  const remotePath = `${RT_REPO}/thoughts/${id}.deleted.json`;
+export async function removeTombstone(id: string, repo: string): Promise<void> {
+  const remotePath = `${RT_REPO}/${repoFolder(repo)}/thoughts/${id}.deleted.json`;
   await runJf(["rt", "delete", remotePath, "--quiet"]).catch(() => {});
 }
 

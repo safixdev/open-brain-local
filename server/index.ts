@@ -12,6 +12,7 @@ import {
   diffSince,
   fetchArtifact,
   listTombstones,
+  liveSubPath,
   probeRtRoot,
   pushArtifact,
   pushTombstone,
@@ -27,11 +28,11 @@ const server = new McpServer({
 
 // search — semantic recall, repo-scoped by default.
 server.registerTool(
-  "search_thoughts",
+  "search_memories",
   {
-    title: "Search Thoughts",
+    title: "Search Memories",
     description:
-      "Semantic search over captured memories. Pass `repo` to scope to your current project; set `all_repos` for global recall.",
+      "Recall stored memories via semantic search. USE PROACTIVELY and FIRST — before answering or acting — whenever the request touches anything that could be remembered. Triggers (non-exhaustive): the user references prior context ('remember', 'recall', 'as we discussed', 'last time', 'previously', 'earlier', 'what did we decide', 'do we have', 'have we', 'did I/we', 'what do you know about'); asks you to VERIFY, check, confirm, or cross-reference against what's known; asks a question whose answer may depend on past decisions, conventions, preferences, identities, or project facts; or you're starting a task that could benefit from prior knowledge. When in doubt, search — a missed recall is worse than an empty result. Pass `repo` to scope to your current project; set `all_repos` for global recall.",
     annotations: {
       readOnlyHint: true,
     },
@@ -69,7 +70,7 @@ server.registerTool(
 
       if (!data || data.length === 0) {
         return {
-          content: [{ type: "text" as const, text: `No thoughts found matching "${query}"${scopeNote}.` }],
+          content: [{ type: "text" as const, text: `No memories found matching "${query}"${scopeNote}.` }],
         };
       }
 
@@ -99,7 +100,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `Found ${data.length} thought(s)${scopeNote}:\n\n${results.join("\n\n")}`,
+            text: `Found ${data.length} memory(ies)${scopeNote}:\n\n${results.join("\n\n")}`,
           },
         ],
       };
@@ -114,11 +115,11 @@ server.registerTool(
 
 // list — browse recent memories with optional filters.
 server.registerTool(
-  "list_thoughts",
+  "list_memories",
   {
-    title: "List Recent Thoughts",
+    title: "List Recent Memories",
     description:
-      "List recent memories, optionally filtered by type, topic, person, or last N days.",
+      "Browse recent memories (chronological), optionally filtered by type, topic, person, or last N days. Use when the user asks what's been remembered/captured lately ('what do we have', 'show recent notes', 'what have we saved'). For topical recall prefer `search_memories`.",
     annotations: {
       readOnlyHint: true,
     },
@@ -127,7 +128,7 @@ server.registerTool(
       type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
       topic: z.string().optional().describe("Filter by topic tag"),
       person: z.string().optional().describe("Filter by person mentioned"),
-      days: z.number().optional().describe("Only thoughts from the last N days"),
+      days: z.number().optional().describe("Only memories from the last N days"),
     },
   },
   async ({ limit, type, topic, person, days }) => {
@@ -142,7 +143,7 @@ server.registerTool(
       }
 
       if (!data || !data.length) {
-        return { content: [{ type: "text" as const, text: "No thoughts found." }] };
+        return { content: [{ type: "text" as const, text: "No memories found." }] };
       }
 
       const results = data.map(
@@ -160,7 +161,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `${data.length} recent thought(s):\n\n${results.join("\n\n")}`,
+            text: `${data.length} recent memory(ies):\n\n${results.join("\n\n")}`,
           },
         ],
       };
@@ -175,11 +176,11 @@ server.registerTool(
 
 // capture — save a memory. The agent owns the metadata (no server-side LLM).
 server.registerTool(
-  "capture_thought",
+  "capture_memory",
   {
-    title: "Capture Thought",
+    title: "Capture Memory",
     description:
-      "Save a memory. You own the metadata — pass `content` as a standalone statement plus `type`/`topics`/`people`/`repo` etc. Set `source` to 'user' (asked to remember) or 'agent-inferred' (proactive). Server only embeds + stores.",
+      "Save a memory for later recall. USE PROACTIVELY whenever something durable and reusable surfaces. Triggers: the user says 'remember', 'note', 'keep in mind', 'for next time', 'don't forget', 'save this', 'make a note'; OR you learn a lasting fact worth not rediscovering — a decision + rationale, a project convention/constraint/architecture choice, a user preference or identity fact, or a non-obvious gotcha. Do NOT capture transient state, secrets/tokens, or trivially re-derivable detail. You own the metadata — pass `content` as a standalone statement plus `type`/`topics`/`people`/`repo` etc. Set `source` to 'user' (explicitly asked) or 'agent-inferred' (you captured it proactively). Server only embeds + stores.",
     annotations: {
       readOnlyHint: false,
       openWorldHint: false,
@@ -201,12 +202,18 @@ server.registerTool(
         .optional()
         .describe("Origin/trust of this memory: 'user' (the user asked to remember it), 'agent-inferred' (you captured it proactively), or another label. Defaults to 'mcp'."),
       git_user: z.string().optional().describe("Git username of the person/agent capturing this memory (e.g. from `git config user.name`). Falls back to the server default if omitted."),
-      repo: z.string().optional().describe("The git repository the memory was captured in, e.g. 'context_as_artifacts'."),
+      repo: z.string().describe("REQUIRED. The git repository this memory belongs to, e.g. 'context_as_artifacts'. Memories are stored and recalled per-repo, so always pass the repo you are working in."),
       context: z.string().optional().describe("Optional short note on the context/situation in which this was captured (e.g. the task or file being worked on)."),
     },
   },
   async ({ content, type, topics, people, action_items, dates_mentioned, source, git_user, repo, context }) => {
     try {
+      if (!repo || !repo.trim()) {
+        return {
+          content: [{ type: "text" as const, text: "Error: `repo` is required — pass the git repo this memory belongs to." }],
+          isError: true,
+        };
+      }
       // Metadata is supplied by the calling agent — no server-side LLM extraction.
       // Fall back to minimal defaults only for the structural fields.
       const metadata: Record<string, unknown> = {
@@ -228,7 +235,7 @@ server.registerTool(
 
       // Resurrect: drop any stale tombstone for this content so a re-captured
       // memory is not removed again by the tombstone-reconcile step.
-      await removeTombstone(artifactId);
+      await removeTombstone(artifactId, repo);
 
       // Sync immediately so the new artifact lands in pgvector before we return.
       await runAutoSync();
@@ -253,11 +260,11 @@ server.registerTool(
 
 // delete — tombstone in Artifactory + drop from pgvector. Identify by id or content.
 server.registerTool(
-  "delete_thought",
+  "delete_memory",
   {
-    title: "Delete Thought",
+    title: "Delete Memory",
     description:
-      "Delete a memory by `id` (sha256) or exact `content`. Writes a durable tombstone in Artifactory (trace of what/when/who) so the deletion sticks across syncs, then removes it from pgvector.",
+      "Delete a memory in a given `repo` by `id` (sha256) or exact `content`. Writes a durable tombstone in Artifactory (trace of what/when/who) so the deletion sticks across syncs, then removes it from pgvector.",
     annotations: {
       readOnlyHint: false,
       openWorldHint: true,
@@ -265,10 +272,13 @@ server.registerTool(
       idempotentHint: true,
     },
     inputSchema: {
+      repo: z
+        .string()
+        .describe("REQUIRED. The git repo the memory belongs to (memories are stored per-repo)."),
       id: z
         .string()
         .optional()
-        .describe("The artifact id (sha256) of the memory to delete, e.g. from artifact_path 'thoughts/<id>.json'."),
+        .describe("The artifact id (sha256) of the memory to delete, e.g. from artifact_path '<repo>/thoughts/<id>.json'."),
       content: z
         .string()
         .optional()
@@ -279,8 +289,14 @@ server.registerTool(
         .describe("Git username of who is deleting, recorded in the tombstone trace. Falls back to the server default."),
     },
   },
-  async ({ id, content, git_user }) => {
+  async ({ repo, id, content, git_user }) => {
     try {
+      if (!repo || !repo.trim()) {
+        return {
+          content: [{ type: "text" as const, text: "Error: `repo` is required to locate the memory." }],
+          isError: true,
+        };
+      }
       let artId = id;
       if (!artId && content) artId = await artifactIdForContent(content);
       if (!artId) {
@@ -290,28 +306,30 @@ server.registerTool(
         };
       }
 
+      const subPath = liveSubPath(repo, artId);
+
       // Best-effort: fetch original content for the tombstone trace if not given.
       let original = content;
       if (!original) {
         try {
-          original = (await fetchArtifact(`thoughts/${artId}.json`)).content;
+          original = (await fetchArtifact(subPath)).content;
         } catch {
           // Artifact may already be gone — tombstone without a snippet.
         }
       }
 
       // 1. Write the tombstone (trace). 2. Remove the live artifact. 3. Drop from pgvector.
-      await pushTombstone(artId, { git_user, content: original });
-      await deleteArtifact(artId).catch(() => {});
-      const { data: removed } = await db.deleteByArtifactPath(`thoughts/${artId}.json`);
+      await pushTombstone(artId, repo, { git_user, content: original });
+      await deleteArtifact(artId, repo).catch(() => {});
+      const { data: removed } = await db.deleteByArtifactPath(subPath);
 
       return {
         content: [
           {
             type: "text" as const,
             text:
-              `Deleted memory ${artId.slice(0, 12)}. Removed ${removed ?? 0} row(s) from pgvector. ` +
-              `Trace kept at thoughts/${artId}.deleted.json.`,
+              `Deleted memory ${artId.slice(0, 12)} from ${repo}. Removed ${removed ?? 0} row(s) from pgvector. ` +
+              `Trace kept at ${subPath.replace(/\.json$/, ".deleted.json")}.`,
           },
         ],
       };
@@ -413,7 +431,9 @@ async function runAutoSync(): Promise<void> {
     const tombstones = await listTombstones();
     tombstonedIds = new Set(tombstones.map((t) => t.id));
     for (const t of tombstones) {
-      const { data: removed } = await db.deleteByArtifactPath(`thoughts/${t.id}.json`);
+      // The live artifact sits next to the tombstone: same path, sans ".deleted".
+      const livePath = t.path.replace(/\.deleted\.json$/, ".json");
+      const { data: removed } = await db.deleteByArtifactPath(livePath);
       if (removed && removed > 0) {
         console.log(`[autosync] tombstone enforced — removed ${t.id.slice(0, 12)} from pgvector`);
       }

@@ -1,6 +1,6 @@
 {
   "name": "Open Brain Up",
-  "description": "Install and start the dockerized Open Brain memory stack (Artifactory-as-SOT) against a team's own Artifactory. Handles jf auth, env/secrets, corp-proxy CA build, startup, and health verification.",
+  "description": "Install and start the dockerized Open Brain memory stack (Artifactory-as-SOT) against a team's own Artifactory. Handles jf auth, one-line env generation, corp-proxy CA build, startup, and health verification.",
   "category": "skills",
   "author": {
     "name": "context-as-artifacts",

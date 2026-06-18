@@ -2,7 +2,7 @@
 
 Run Open Brain fully in containers: Postgres + pgvector, HuggingFace TEI (embeddings), and the MCP server. Artifactory is the source of truth for memories; pgvector is a rebuildable search index synced from it.
 
-> Metadata (topics, type, people, …) is supplied by the **calling agent** via `capture_thought` — this stack runs **no chat model**. The only model is the embedding model.
+> Metadata (topics, type, people, …) is supplied by the **calling agent** via `capture_memory` — this stack runs **no chat model**. The only model is the embedding model.
 
 > **Operators:** the canonical install/startup runbook is the `open-brain-up` skill (`skills/open-brain-up/`). This README is the reference; the skill is the procedure.
 
@@ -27,35 +27,24 @@ cd open-brain
 git checkout local-deploy-docker-no-supabase
 ```
 
-### 2. Copy config files
+### 2. Config (one value)
+
+The stack is self-contained — `docker-compose.yml` hardcodes all plumbing. The only
+input is your memories repo. Drop a one-line `.env` (compose auto-loads it):
 
 ```bash
 cd docker
-cp .env.example .env
-cp .env.secrets.example .env.secrets
+echo "RT_REPO=<your-memories-repo>" > .env
+# only if your default jf server isn't 'intro':
+echo "JF_SERVER_ID=<your-server-id>" >> .env
 ```
 
-### 3. Set the secret in `.env.secrets`
-
-```bash
-openssl rand -hex 32   # paste as POSTGRES_PASSWORD
-```
-
-Edit `docker/.env.secrets`:
-```
-POSTGRES_PASSWORD=<your 64-hex password>
-```
+There is **no `.env.secrets`** and **no Postgres password**: the loopback-only DB
+runs with trust auth (its port is never published). Optional `.env` overrides:
+`PORT` (default `8787`), `GIT_USER`, `OPENBRAIN_IMAGE`, `TEI_IMAGE` (arm64 tag).
 
 > The MCP endpoint has no auth and binds to `127.0.0.1` only — it's a private
 > per-developer service. Shared-memory access control lives in Artifactory.
-
-### 4. (Optional) Review non-secret config in `.env`
-
-The defaults in `.env` work out of the box, but set these for your team:
-- `EMBED_MODEL=mxbai-embed-large` — 1024-dim embedding model (the only model)
-- `PORT=8787` — host port for the MCP server
-- `JF_SERVER_ID` / `RT_REPO` — your Artifactory server-id and memories repo
-- `GIT_USER` — fallback pusher identity recorded on memories
 
 You must also provide Artifactory credentials for the `jf` CLI — see the
 `open-brain-up` skill for the `jf config add` + mount step.
@@ -104,13 +93,13 @@ curl -s "${BASE}/health"   # -> {"status":"ok"}
 curl -s -X POST "${BASE}/" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture_thought","arguments":{"content":"Docker smoke test from Open Brain"}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture_memory","arguments":{"content":"Docker smoke test from Open Brain"}}}'
 
 # Search for it
 curl -s -X POST "${BASE}/" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_thoughts","arguments":{"query":"docker smoke test"}}}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_memories","arguments":{"query":"docker smoke test"}}}'
 ```
 
 Expected:
@@ -131,7 +120,7 @@ jq '.mcpServers["open-brain"] = {
 }' ~/.claude.json > /tmp/.claude.json.new && mv /tmp/.claude.json.new ~/.claude.json
 ```
 
-Restart Claude Code, then run `/mcp` — `open-brain` should appear with its four tools (`capture_thought`, `search_thoughts`, `list_thoughts`, `delete_thought`).
+Restart Claude Code, then run `/mcp` — `open-brain` should appear with its four tools (`capture_memory`, `search_memories`, `list_memories`, `delete_memory`).
 
 ### Claude Desktop
 
@@ -188,7 +177,7 @@ docker compose ps
 
 | Symptom | Fix |
 |---|---|
-| `server` exits immediately | Check `docker compose logs server` — likely missing env vars in `.env.secrets` |
+| `server` exits immediately | Check `docker compose logs server` — likely jf config not mounted (`jfrog-config/`) or `RT_REPO` unset |
 | `tei` unhealthy with a CDN/`xethub` download error | Proxy blocks HF's CDN — pre-fetch the model and set `EMBED_MODEL=/model` (see `open-brain-up` skill) |
 | `tei` pull fails with `manifest unknown` | arm64 host — set `TEI_IMAGE=...:cpu-arm64-latest` |
 | `expected 1024 dimensions` error | Wrong `EMBED_MODEL` — must be a 1024-dim model (mxbai-embed-large-v1) matching the DB schema |

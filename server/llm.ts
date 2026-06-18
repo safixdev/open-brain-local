@@ -3,7 +3,7 @@
 // Provider is selected via env vars; defaults target local Ollama on the host.
 //
 // Note: there is no chat/LLM metadata extraction here. The calling agent
-// (Claude/Cursor/etc.) owns metadata and passes it to capture_thought directly.
+// (Claude/Cursor/etc.) owns metadata and passes it to capture_memory directly.
 // The only model this stack runs is the embedding model.
 
 export async function getEmbedding(text: string): Promise<number[]> {
