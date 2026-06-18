@@ -71,10 +71,11 @@ export interface Db {
   // RT tombstones — returns the number of rows deleted.
   deleteByArtifactPath(artifactPath: string): Promise<DbResult<number>>;
 
-  // Persisted autosync cursor (ISO timestamp). Survives server restarts so a
-  // reboot does not re-scan/re-download every artifact from Artifactory.
-  getSyncCursor(): Promise<DbResult<string | null>>;
-  setSyncCursor(iso: string): Promise<DbResult<null>>;
+  // Persisted key/value state in sync_state. Used for the per-repo autosync
+  // cursors (key "cursor:<repo>") and the persisted repo scope (key "sync_repos").
+  // Survives restarts so a reboot does not re-scan/re-download every artifact.
+  getSyncCursor(key?: string): Promise<DbResult<string | null>>;
+  setSyncCursor(iso: string, key?: string): Promise<DbResult<null>>;
 }
 
 // ── Supabase driver ──────────────────────────────────────────────────────────
@@ -180,19 +181,19 @@ function makeSupabaseDb(): Db {
       return { data: count ?? 0, error };
     },
 
-    async getSyncCursor() {
+    async getSyncCursor(key = "autosync_cursor") {
       const { data, error } = await sb()
         .from("sync_state")
         .select("value")
-        .eq("key", "autosync_cursor")
+        .eq("key", key)
         .maybeSingle();
       return { data: (data?.value as string) ?? null, error };
     },
 
-    async setSyncCursor(iso) {
+    async setSyncCursor(iso, key = "autosync_cursor") {
       const { error } = await sb()
         .from("sync_state")
-        .upsert({ key: "autosync_cursor", value: iso });
+        .upsert({ key, value: iso });
       return { data: null, error };
     },
   };
@@ -383,7 +384,7 @@ function makePostgresDb(): Db {
       }
     },
 
-    async getSyncCursor() {
+    async getSyncCursor(key = "autosync_cursor") {
       const client = await pool.connect();
       try {
         // Lazily ensure the table exists so existing deploys upgrade without a
@@ -396,7 +397,8 @@ function makePostgresDb(): Db {
            )`,
         );
         const result = await client.queryObject<{ value: string }>(
-          `SELECT value FROM sync_state WHERE key = 'autosync_cursor' LIMIT 1`,
+          `SELECT value FROM sync_state WHERE key = $1 LIMIT 1`,
+          [key],
         );
         return { data: result.rows[0]?.value ?? null, error: null };
       } catch (e) {
@@ -406,14 +408,14 @@ function makePostgresDb(): Db {
       }
     },
 
-    async setSyncCursor(iso) {
+    async setSyncCursor(iso, key = "autosync_cursor") {
       const client = await pool.connect();
       try {
         await client.queryObject(
           `INSERT INTO sync_state (key, value, updated_at)
-           VALUES ('autosync_cursor', $1, now())
+           VALUES ($1, $2, now())
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-          [iso],
+          [key, iso],
         );
         return { data: null, error: null };
       } catch (e) {

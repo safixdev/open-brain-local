@@ -177,10 +177,15 @@ export async function pushArtifact(thought: ThoughtArtifact): Promise<string> {
 
 // List all live thought artifacts in the repo, sorted by created asc.
 // Tombstone markers (*.deleted.json) are excluded — they are not thoughts.
-export async function listArtifacts(): Promise<{ path: string; created: string }[]> {
+export async function listArtifacts(repo?: string): Promise<{ path: string; created: string }[]> {
+  // Scope to a single repo's folder when given — clients only cache repos they
+  // actually use, instead of mirroring every team's memories locally.
+  const pattern = repo
+    ? `${RT_REPO}/${repoFolder(repo)}/thoughts/*.json`
+    : `${RT_REPO}/*/thoughts/*.json`;
   const { code, stdout, stderr } = await runJf([
     "rt", "search",
-    `${RT_REPO}/*/thoughts/*.json`,
+    pattern,
   ]);
   if (code !== 0) throw new Error(`jf rt search failed: ${stderr}`);
   if (!stdout || stdout === "[]") return [];
@@ -199,10 +204,13 @@ export type Tombstone = { id: string; path: string; created: string };
 
 // List all tombstone markers (deleted memories). The id is the artifact id of
 // the memory that was deleted (filename is "<id>.deleted.json").
-export async function listTombstones(): Promise<Tombstone[]> {
+export async function listTombstones(repo?: string): Promise<Tombstone[]> {
+  const pattern = repo
+    ? `${RT_REPO}/${repoFolder(repo)}/thoughts/*.deleted.json`
+    : `${RT_REPO}/*/thoughts/*.deleted.json`;
   const { code, stdout, stderr } = await runJf([
     "rt", "search",
-    `${RT_REPO}/*/thoughts/*.deleted.json`,
+    pattern,
   ]);
   if (code !== 0) throw new Error(`jf rt search (tombstones) failed: ${stderr}`);
   if (!stdout || stdout === "[]") return [];

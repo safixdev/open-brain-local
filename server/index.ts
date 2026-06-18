@@ -9,14 +9,15 @@ import { db } from "./db.ts";
 import {
   artifactIdForContent,
   deleteArtifact,
-  diffSince,
   fetchArtifact,
+  listArtifacts,
   listTombstones,
   liveSubPath,
   probeRtRoot,
   pushArtifact,
   pushTombstone,
   removeTombstone,
+  repoFolder,
 } from "./artifactory.ts";
 
 // --- MCP Server Setup ---
@@ -48,11 +49,18 @@ server.registerTool(
         .boolean()
         .optional()
         .default(false)
-        .describe("Search across ALL repos, ignoring `repo`. Use only when the user explicitly asks for cross-repo / global memory."),
+        .describe("Search across ALL repos this client has cached, ignoring `repo`. Use only when the user explicitly asks for cross-repo / global memory. Note: only repos previously captured-to or searched are cached locally."),
     },
   },
   async ({ query, limit, threshold, repo, all_repos }) => {
     try {
+      // Repo-scoped cache: if this is the first time we see `repo`, add it to the
+      // scope and backfill it now so this very search can return its memories.
+      if (repo && !all_repos) {
+        const isNew = await addRepoToScope(repo);
+        if (isNew) await syncRepo(repo);
+      }
+
       const qEmb = await getEmbedding(query);
       // Repo scoping: filter to the agent's current repo unless cross-repo is
       // explicitly requested. metadata @> {repo} is applied by match_thoughts.
@@ -237,8 +245,10 @@ server.registerTool(
       // memory is not removed again by the tombstone-reconcile step.
       await removeTombstone(artifactId, repo);
 
-      // Sync immediately so the new artifact lands in pgvector before we return.
-      await runAutoSync();
+      // Ensure this repo is in the cache scope, then sync just this repo so the
+      // new artifact lands in pgvector before we return.
+      await addRepoToScope(repo);
+      await syncRepo(repo);
 
       let confirmation = `Captured as ${metadata.type}`;
       const tags = metadata.topics as string[];
@@ -389,108 +399,133 @@ app.all("*", async (c) => {
   return transport.handleRequest(c);
 });
 
-// --- Autosync: Artifactory → Postgres every 5 minutes ---
-// The cursor advances after each successful run so only genuinely new Artifactory
-// artifacts are fetched. It is persisted in Postgres (sync_state) and restored on
-// startup, so a restart does not re-scan/re-download the entire repo. A fresh DB
-// starts at epoch (safe — upsert_thought is idempotent; hasEmbedding skips
-// re-embedding), then converges after the first run.
+// --- Autosync: Artifactory → Postgres ---
+// Sync is REPO-SCOPED: each client only caches the repos it actually uses, so a
+// developer's local pgvector never mirrors other teams' memories. The scope set is
+// seeded from SYNC_REPOS (comma-separated) and grown lazily whenever a repo is
+// captured to / searched. Each repo has its own cursor (sync_state key
+// "cursor:<repo>") advanced to the max RT `created` timestamp actually observed —
+// RT's clock, never the client's — so local clock skew can't silently skip a
+// teammate's new memory. A fresh repo starts at epoch (full backfill);
+// upsert_thought is idempotent and hasEmbedding skips re-embeds.
 
 const AUTOSYNC_INTERVAL_MS = parseInt(
   Deno.env.get("AUTOSYNC_INTERVAL_MS") ?? String(5 * 60 * 1000),
 );
 const EPOCH = "1970-01-01T00:00:00.000Z";
-let _syncCursor = EPOCH;
-let _cursorLoaded = false;
 
-// Restore the persisted cursor once, before the first sync runs.
-async function loadCursor(): Promise<void> {
-  if (_cursorLoaded) return;
+// Repos this client caches. Seeded from SYNC_REPOS, persisted in sync_state, and
+// grown by capture_memory / search_memories.
+const _syncRepos = new Set<string>(
+  (Deno.env.get("SYNC_REPOS") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+let _scopeLoaded = false;
+
+async function loadScope(): Promise<void> {
+  if (_scopeLoaded) return;
   try {
-    const { data, error } = await db.getSyncCursor();
-    if (error) {
-      console.error("[autosync] cursor load failed (starting at epoch):", error.message);
-    } else if (data) {
-      _syncCursor = data;
-      console.log(`[autosync] cursor restored → ${_syncCursor.slice(0, 19)}`);
+    const { data } = await db.getSyncCursor("sync_repos");
+    if (data) {
+      for (const r of data.split(",").map((s) => s.trim()).filter(Boolean)) _syncRepos.add(r);
     }
   } catch (err) {
-    console.error("[autosync] cursor load threw (starting at epoch):", (err as Error).message);
+    console.error("[autosync] scope load failed:", (err as Error).message);
   }
-  _cursorLoaded = true;
+  _scopeLoaded = true;
 }
 
-async function runAutoSync(): Promise<void> {
-  await loadCursor();
+// Add a repo to the cache scope. Returns true if newly added — callers backfill it
+// immediately (syncRepo) so the current request sees its data.
+async function addRepoToScope(repo: string): Promise<boolean> {
+  const r = repo.trim();
+  if (!r) return false;
+  await loadScope();
+  if (_syncRepos.has(r)) return false;
+  _syncRepos.add(r);
+  await db.setSyncCursor([..._syncRepos].join(","), "sync_repos").catch((e) =>
+    console.error("[autosync] scope persist failed:", (e as Error).message)
+  );
+  console.log(`[autosync] repo added to cache scope → ${r}`);
+  return true;
+}
 
-  // Reconcile tombstones first (independent of the diff cursor — a tombstone can
-  // target an artifact created long before the cursor). Any memory that has been
-  // tombstoned in RT is removed from pgvector here, and skipped during indexing.
+// Sync one repo: enforce its tombstones, then index its new artifacts.
+async function syncRepo(repo: string): Promise<void> {
+  const cursorKey = `cursor:${repoFolder(repo)}`;
+  let cursor = EPOCH;
+  const { data: saved } = await db.getSyncCursor(cursorKey);
+  if (saved) cursor = saved;
+
   let tombstonedIds = new Set<string>();
   try {
-    const tombstones = await listTombstones();
+    const tombstones = await listTombstones(repo);
     tombstonedIds = new Set(tombstones.map((t) => t.id));
     for (const t of tombstones) {
       // The live artifact sits next to the tombstone: same path, sans ".deleted".
       const livePath = t.path.replace(/\.deleted\.json$/, ".json");
       const { data: removed } = await db.deleteByArtifactPath(livePath);
       if (removed && removed > 0) {
-        console.log(`[autosync] tombstone enforced — removed ${t.id.slice(0, 12)} from pgvector`);
+        console.log(`[autosync] (${repo}) tombstone enforced — removed ${t.id.slice(0, 12)}`);
       }
     }
   } catch (err) {
-    console.error("[autosync] tombstone reconcile failed:", (err as Error).message);
+    console.error(`[autosync] (${repo}) tombstone reconcile failed:`, (err as Error).message);
   }
 
-  const newArtifacts = await diffSince(_syncCursor);
+  const all = await listArtifacts(repo); // sorted asc by created
+  // Skew-safe: advance the cursor to the max RT `created` observed, not the local
+  // wall clock. `>= cursor` re-includes the boundary item (idempotent upsert).
+  let maxCreated = cursor;
+  for (const a of all) if (a.created > maxCreated) maxCreated = a.created;
+  const fresh = all.filter((a) => a.created >= cursor);
 
-  if (!newArtifacts.length) {
-    console.log(`[autosync] up to date (cursor: ${_syncCursor.slice(0, 19)})`);
-    return;
+  if (fresh.length) {
+    console.log(`[autosync] (${repo}) ${fresh.length} artifact(s) at/after ${cursor.slice(0, 19)}`);
   }
 
-  console.log(`[autosync] ${newArtifacts.length} new artifact(s) since ${_syncCursor.slice(0, 19)}`);
-
-  for (const { path } of newArtifacts) {
-    // Never index a tombstoned memory.
+  for (const { path } of fresh) {
     const artId = path.split("/").pop()!.replace(/\.json$/, "");
-    if (tombstonedIds.has(artId)) {
-      console.log(`[autosync] skip tombstoned: ${artId.slice(0, 12)}`);
-      continue;
-    }
+    if (tombstonedIds.has(artId)) continue;
     try {
       const artifact = await fetchArtifact(path);
-
       const { data: upsertData, error: upsertErr } = await db.upsertThought(
         artifact.content,
         { metadata: { ...artifact.metadata, artifact_path: path } },
       );
-
       if (upsertErr || !upsertData) {
-        console.error(`[autosync] upsert failed for ${path}:`, upsertErr?.message);
+        console.error(`[autosync] (${repo}) upsert failed for ${path}:`, upsertErr?.message);
         continue;
       }
-
       const { data: alreadyEmbedded } = await db.hasEmbedding(upsertData.id);
-      if (alreadyEmbedded) {
-        console.log(`[autosync] skip embed (already present): ${artifact.content.slice(0, 60)}`);
-        continue;
-      }
-
+      if (alreadyEmbedded) continue;
       const embedding = await getEmbedding(artifact.content);
       await db.updateEmbedding(upsertData.id, embedding);
-      console.log(`[autosync] embedded: ${artifact.content.slice(0, 60)}`);
+      console.log(`[autosync] (${repo}) embedded: ${artifact.content.slice(0, 60)}`);
     } catch (err) {
-      console.error(`[autosync] error on ${path}:`, (err as Error).message);
+      console.error(`[autosync] (${repo}) error on ${path}:`, (err as Error).message);
     }
   }
 
-  // Advance cursor to now — next run fetches only artifacts created after this
-  // point — and persist it so a restart resumes here instead of re-scanning all.
-  _syncCursor = new Date().toISOString();
-  const { error: saveErr } = await db.setSyncCursor(_syncCursor);
-  if (saveErr) console.error("[autosync] cursor persist failed:", saveErr.message);
-  console.log(`[autosync] cursor → ${_syncCursor.slice(0, 19)}`);
+  if (maxCreated !== cursor) {
+    const { error: saveErr } = await db.setSyncCursor(maxCreated, cursorKey);
+    if (saveErr) console.error(`[autosync] (${repo}) cursor persist failed:`, saveErr.message);
+    else console.log(`[autosync] (${repo}) cursor → ${maxCreated.slice(0, 19)}`);
+  }
+}
+
+async function runAutoSync(): Promise<void> {
+  await loadScope();
+  if (_syncRepos.size === 0) {
+    console.log("[autosync] no repos in scope yet — capture or search a repo to start caching");
+    return;
+  }
+  for (const repo of _syncRepos) {
+    try {
+      await syncRepo(repo);
+    } catch (err) {
+      console.error(`[autosync] (${repo}) sync failed:`, (err as Error).message);
+    }
+  }
 }
 
 // Fire immediately on startup, then on the configured interval.

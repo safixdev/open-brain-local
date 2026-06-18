@@ -92,6 +92,11 @@ services:
       RT_REPO: "${RT_REPO:-open-brain-memories}"
       JF_SERVER_ID: "${JF_SERVER_ID:-intro}"
       GIT_USER: "${GIT_USER:-unknown}"
+      # Optional: pre-seed which repos this client caches (comma-separated). The
+      # scope also grows automatically as repos are captured-to / searched.
+      SYNC_REPOS: "${SYNC_REPOS:-}"
+      # Optional: autosync poll interval in ms (default 300000 = 5 min).
+      AUTOSYNC_INTERVAL_MS: "${AUTOSYNC_INTERVAL_MS:-300000}"
     volumes:
       # jf auth: the server shells out to `jf` using this mounted config.
       - ./jfrog-config:/home/deno/.jfrog:ro
